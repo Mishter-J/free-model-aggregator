@@ -1,0 +1,1 @@
+{"description":"A deterministic free-model aggregator: one server that answers OpenAI Chat Completions and Anthropic Messages with the best free model that meets each request.","license":"MIT","name":"free-model-aggregator","private":true,"type":"module","version":"1.0.0"}
