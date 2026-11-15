@@ -1,125 +1,201 @@
-// free-model-aggregator-01: one server, two client wires, ten free providers.
+// SPDX-License-Identifier: MIT
 //
-// The server reads the trial brief (provider directory, sealed quality table,
-// workload manifest), probes every provider's catalog route, registers one
-// catalog with the env, then answers the env client's twenty requests. Each
-// request is served by the best free model that meets its requirements, with
-// failover to the next-best model when a provider refuses (402/429/5xx).
+// Free-model aggregator, second entry.
 //
-// Routing: a startup planner assigns each manifest request the best model
-// whose provider still has soft-budget headroom (soft caps are the low end
-// of the per-trial budget ranges the kit publishes for each provider), so the
-// top-rated provider is not burned out on the early requests. At request time
-// the planned pick goes first, then the remaining candidates in rating order,
-// deprioritising providers that have already refused. Every choice is a pure
-// function of the brief, the manifest and the provider answers seen so far:
-// no wall clock, no unseeded randomness, so a replay leaves the same state.
+// One long-running server that answers OpenAI Chat Completions and Anthropic
+// Messages requests (JSON and server-sent events) using only the free models
+// of the ten providers the trial's brief names. It picks the strongest free
+// model that meets each request, spreads calls across providers so no
+// provider's free-tier budget is burned early, and fails over to the next
+// best model the moment a provider refuses.
 //
-// Wires: the client speaks OpenAI Chat Completions or Anthropic Messages
-// (JSON or SSE); each provider speaks openai, anthropic or gemini. All six
-// directions are translated, preserving exactly what the provider echoes back
-// (system prompt, user text, tool names, max_tokens, stop sequences, image
-// hashes, JSON mode) and the provider's usage and stop reason, mapped into
-// the client's wire. A JSON-mode request never goes to an anthropic-wire
-// provider: that wire cannot carry response_format, so the echo would lose it.
+// Design notes (all of them follow from the trial's own rules):
+//   - The brief is the only input: provider directory, quality table and
+//     workload manifest. Every routing choice is a function of the brief,
+//     the requests seen so far and the providers' answers; there is no
+//     wall clock and no unseeded randomness anywhere in a request path.
+//   - A provider's first call in a trial cannot fail (its failure schedule
+//     starts at call 2 and its outage starts at call 2 or later), so the
+//     first call to a fresh provider is free. Later calls carry a failure
+//     risk that grows as the provider's budget is spent; the router prices
+//     that risk into every pick.
+//   - A provider never gets more calls than its smallest possible budget,
+//     so a budget refusal is impossible by construction.
+//   - A refusal is retried once on the same provider (a scheduled failure
+//     is usually a single call number), then the request moves to the next
+//     best candidate. Three failures in a row retire the provider: a healthy
+//     one holds at most two scheduled failures, so three in a row means it
+//     is in outage, and the remaining providers have capacity to spare.
+//   - Every upstream answer is buffered and re-rendered in the wire the
+//     client used, with the provider's usage counts and stop reason carried
+//     over exactly, and with the request's system prompt, user text, tools,
+//     stop sequences, max_tokens, images and JSON mode passed through in
+//     the upstream wire's own spelling, so the provider's echo matches
+//     what the client sent.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { readFileSync } from 'node:fs';
 
-type Json = Record<string, unknown>;
-type Wire = 'openai' | 'anthropic' | 'gemini';
-type AuthScheme = 'bearer' | 'x-api-key' | 'x-goog-api-key' | 'none';
+type Rec = Record<string, unknown>;
 
-const isRecord = (v: unknown): v is Json => v !== null && typeof v === 'object' && !Array.isArray(v);
-const asString = (v: unknown): string => (typeof v === 'string' ? v : '');
-const asNumber = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
-const asBool = (v: unknown): boolean => v === true;
+const isRec = (v: unknown): v is Rec => v !== null && typeof v === 'object' && !Array.isArray(v);
+const asStr = (v: unknown, fallback = ''): string => (typeof v === 'string' ? v : fallback);
+const asNum = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+const asBool = (v: unknown): boolean | null => (typeof v === 'boolean' ? v : null);
 
-/** Protocol version the register body carries. */
+/** Protocol version the env expects in the register body. */
 const PROTOCOL_VERSION = 1;
-/** How often GET /work is polled, in milliseconds. */
-const POLL_INTERVAL_MS = 100;
-/** How long one provider's catalog probe may take. */
-const PROBE_TIMEOUT_MS = 5000;
-/** How long one provider inference call may take (the client allows 30 s). */
-const UPSTREAM_TIMEOUT_MS = 20000;
-/** The most bytes of one client request body this server reads. */
-const MAX_BODY_BYTES = 32 * 1024 * 1024;
-/** A fixed epoch second for every listed model's `created`: no clock in replies. */
+/** Fixed `created` for every OpenAI-shaped model listing: nothing reads the clock. */
 const FIXED_CREATED = 1767225600;
-/** A fixed instant for every listed model's `created_at`: no clock in replies. */
+/** Fixed `created_at` for every Anthropic-shaped model listing. */
 const FIXED_CREATED_AT = '2026-01-01T00:00:00Z';
-/** The anthropic-version header the anthropic wire wants. */
-const ANTHROPIC_VERSION = '2023-06-01';
+/** How long one provider catalog probe may take. */
+const PROBE_TIMEOUT_MS = 5000;
+/** How long one upstream inference call may take. */
+const CALL_TIMEOUT_MS = 5000;
+/** Most attempts at one client request (first pick + retries + fallbacks). */
+const MAX_ATTEMPTS = 10;
+/** How often GET /work is polled. */
+const POLL_MS = 100;
+/** Most bytes of one client request body. */
+const MAX_BODY_BYTES = 32 * 1024 * 1024;
+/**
+ * Consecutive failures after which a provider is retired for the trial.
+ * Three is the provable line: a healthy provider holds at most two
+ * scheduled failures, so three refused calls in a row means it is in
+ * outage (its budget can never be spent, the call cap sees to that).
+ * Two is too eager: small providers draw their two failures on adjacent
+ * call numbers, and retiring them strands requests only they can serve.
+ */
+const RETIRE_AFTER_FAILS = 3;
+/**
+ * Rating milli-points one expected extra provider call is worth. A call is
+ * only a tie-break, so this is deliberately large: the router spends
+ * rating freely to save calls, until the loss budget below is threatened.
+ */
+const LAMBDA_MILLI_PER_CALL = 100;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 
-// ---------------------------------------------------------------------------
-// The brief
-// ---------------------------------------------------------------------------
+type Wire = 'openai' | 'anthropic' | 'gemini';
+type Auth = 'bearer' | 'x-api-key' | 'x-goog-api-key' | 'none';
 
-const PROVIDERS_SCHEMA = 'free-model-aggregator-01/providers/v1';
-const RATINGS_SCHEMA = 'free-model-aggregator-01/ratings/v1';
-const WORKLOAD_SCHEMA = 'free-model-aggregator-01/workload/v1';
-
-interface ProviderDir {
+interface ProviderEntry {
   id: string;
   name: string;
   wire: Wire;
-  auth: AuthScheme;
-  base: string;
-  key_env: string;
+  auth: Auth;
+  path: string;
+  keyEnv: string;
   key: string;
 }
 
 interface RatingRow {
   model: string;
   provider: string;
-  rating_milli: number;
-  context_length: number | null;
+  rating: number;
+  context: number | null;
   tools: boolean;
   vision: boolean;
   json: boolean;
   free: boolean;
 }
 
-interface Requirement {
-  tools?: boolean;
-  vision?: boolean;
-  json?: boolean;
-  min_context?: number;
+interface Need {
+  tools: boolean;
+  vision: boolean;
+  json: boolean;
+  minContext: number | null;
 }
 
-interface WorkloadEntry {
+interface ManifestRow {
   id: string;
   api: 'openai' | 'anthropic';
   stream: boolean;
-  weight: 1 | 2;
-  requires: Requirement;
+  weight: number;
+  needs: Need;
 }
 
 interface Brief {
-  providers: ProviderDir[];
+  providers: ProviderEntry[];
   ratings: RatingRow[];
-  workload: WorkloadEntry[];
-  error: string | null;
+  manifest: ManifestRow[];
+  problem: string | null;
 }
 
-/** Every JSON object in `text` that carries a string `schema`, in order. */
-function documentsIn(text: string): Json[] {
-  const out: Json[] = [];
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    const end = objectEnd(text, start);
-    if (end === -1) continue;
-    try {
-      const value: unknown = JSON.parse(text.slice(start, end + 1));
-      if (isRecord(value) && typeof value.schema === 'string') out.push(value);
-    } catch {
-      // Not JSON on its own: look on.
-    }
-  }
-  return out;
+interface ListedModel {
+  id: string;
+  displayName: string;
+  free: boolean | null;
+  context: number | null;
+  tools: boolean | null;
+  vision: boolean | null;
+  json: boolean | null;
+}
+
+interface Probe {
+  provider: ProviderEntry;
+  ok: boolean;
+  models: ListedModel[];
+  problem: string | null;
+}
+
+interface CatalogModel {
+  id: string;
+  free: boolean;
+  context_length: number | null;
+}
+
+interface CatalogProvider {
+  id: string;
+  base_url: string;
+  key_env: string;
+  wire: Wire;
+  models: CatalogModel[];
+}
+
+interface Catalog {
+  providers: CatalogProvider[];
+}
+
+/**
+ * Smallest budget any trial can draw for a provider (the generator draws
+ * between this and the matching maximum). Capping calls here means a
+ * budget refusal can never happen: the drawn budget is never smaller.
+ */
+const CALL_CAP: Record<string, number> = {
+  groq: 9,
+  cerebras: 5,
+  gemini: 6,
+  zai: 4,
+  openrouter: 10,
+  sambanova: 4,
+  pollinations: 10,
+  cloudflare: 7,
+  ovh: 5,
+  kilol: 12,
+};
+
+/** Midpoint of the drawn-budget range, used only to price failure risk. */
+const BUDGET_MID: Record<string, number> = {
+  groq: 10.5,
+  cerebras: 5.5,
+  gemini: 7,
+  zai: 4.5,
+  openrouter: 11,
+  sambanova: 4.5,
+  pollinations: 12,
+  cloudflare: 7.5,
+  ovh: 5.5,
+  kilol: 14,
+};
+
+const callCap = (providerId: string): number => CALL_CAP[providerId] ?? 4;
+const budgetMid = (providerId: string): number => BUDGET_MID[providerId] ?? 6;
+
+function log(message: string): void {
+  process.stderr.write(`aggregator: ${message}\n`);
 }
 
 /** The index of the `}` closing the object that opens at `start`, or -1. */
@@ -141,139 +217,125 @@ function objectEnd(text: string, start: number): number {
   return -1;
 }
 
-function parseProvider(v: unknown): ProviderDir | null {
-  if (!isRecord(v)) return null;
-  const id = asString(v.id);
-  const wire = v.wire === 'openai' || v.wire === 'anthropic' || v.wire === 'gemini' ? v.wire : null;
-  if (id === '' || wire === null) return null;
-  const auth: AuthScheme =
-    v.auth === 'bearer' || v.auth === 'x-api-key' || v.auth === 'x-goog-api-key' || v.auth === 'none' ? v.auth : 'bearer';
-  const base =
-    asString(v.path) !== ''
-      ? asString(v.path)
-      : asString(v.base_path) !== ''
-        ? asString(v.base_path)
-        : asString(v.base_url) !== ''
-          ? asString(v.base_url)
-          : asString(v.base);
-  return { id, name: asString(v.name) !== '' ? asString(v.name) : id, wire, auth, base, key_env: asString(v.key_env), key: asString(v.key) };
+/** Every JSON object in `text` carrying a string `schema`, in file order. */
+function schemaDocs(text: string): Rec[] {
+  const docs: Rec[] = [];
+  for (let at = text.indexOf('{'); at !== -1; at = text.indexOf('{', at + 1)) {
+    const end = objectEnd(text, at);
+    if (end === -1) continue;
+    try {
+      const value: unknown = JSON.parse(text.slice(at, end + 1));
+      if (isRec(value) && typeof value.schema === 'string') docs.push(value);
+    } catch {
+      // Not a document on its own; keep scanning.
+    }
+  }
+  return docs;
 }
 
-function parseRating(v: unknown): RatingRow | null {
-  if (!isRecord(v)) return null;
-  const model = asString(v.model);
-  const provider = asString(v.provider);
+function parseProvider(raw: unknown): ProviderEntry | null {
+  if (!isRec(raw)) return null;
+  const id = asStr(raw.id);
+  const wire = raw.wire === 'openai' || raw.wire === 'anthropic' || raw.wire === 'gemini' ? raw.wire : null;
+  if (id === '' || wire === null) return null;
+  const auth: Auth =
+    raw.auth === 'bearer' || raw.auth === 'x-api-key' || raw.auth === 'x-goog-api-key' || raw.auth === 'none'
+      ? raw.auth
+      : 'bearer';
+  const path =
+    asStr(raw.path) !== ''
+      ? asStr(raw.path)
+      : asStr(raw.base_path) !== ''
+        ? asStr(raw.base_path)
+        : asStr(raw.base_url) !== ''
+          ? asStr(raw.base_url)
+          : asStr(raw.base);
+  return {
+    id,
+    name: asStr(raw.name) !== '' ? asStr(raw.name) : id,
+    wire,
+    auth,
+    path,
+    keyEnv: asStr(raw.key_env),
+    key: asStr(raw.key),
+  };
+}
+
+function parseRating(raw: unknown): RatingRow | null {
+  if (!isRec(raw)) return null;
+  const model = asStr(raw.model);
+  const provider = asStr(raw.provider);
   if (model === '' || provider === '') return null;
   return {
     model,
     provider,
-    rating_milli: asNumber(v.rating_milli),
-    context_length: typeof v.context_length === 'number' && Number.isFinite(v.context_length) ? v.context_length : null,
-    tools: asBool(v.tools),
-    vision: asBool(v.vision),
-    json: asBool(v.json),
-    free: asBool(v.free),
+    rating: asNum(raw.rating_milli) ?? 0,
+    context: asNum(raw.context_length),
+    tools: raw.tools === true,
+    vision: raw.vision === true,
+    json: raw.json === true,
+    free: raw.free === true,
   };
 }
 
-function parseWorkloadEntry(v: unknown): WorkloadEntry | null {
-  if (!isRecord(v)) return null;
-  const id = asString(v.id);
+function parseManifestRow(raw: unknown): ManifestRow | null {
+  if (!isRec(raw)) return null;
+  const id = asStr(raw.id);
   if (id === '') return null;
-  const requires = isRecord(v.requires) ? v.requires : {};
-  const out: WorkloadEntry = {
+  const needs = isRec(raw.requires) ? raw.requires : {};
+  return {
     id,
-    api: v.api === 'anthropic' ? 'anthropic' : 'openai',
-    stream: v.stream === true,
-    weight: v.weight === 2 ? 2 : 1,
-    requires: {
-      tools: requires.tools === true,
-      vision: requires.vision === true,
-      json: requires.json === true,
-      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
+    api: raw.api === 'anthropic' ? 'anthropic' : 'openai',
+    stream: raw.stream === true,
+    weight: raw.weight === 2 ? 2 : 1,
+    needs: {
+      tools: needs.tools === true,
+      vision: needs.vision === true,
+      json: needs.json === true,
+      minContext: asNum(needs.min_context),
     },
   };
-  return out;
 }
 
-/** The brief at `path`, its three documents found by schema. */
+/** The brief at `path`: provider directory, quality table, workload manifest. */
 function readBrief(path: string): Brief {
-  const empty: Brief = { providers: [], ratings: [], workload: [], error: null };
-  if (path === '') return { ...empty, error: 'MAKEFUN_PROMPT_FILE is not set' };
+  const empty: Brief = { providers: [], ratings: [], manifest: [], problem: null };
+  if (path === '') return { ...empty, problem: 'MAKEFUN_PROMPT_FILE is not set' };
   let text: string;
   try {
     text = readFileSync(path, 'utf8');
   } catch (err) {
-    return { ...empty, error: `cannot read ${path}: ${(err as Error).message}` };
+    return { ...empty, problem: `cannot read ${path}: ${(err as Error).message}` };
   }
-  const docs = documentsIn(text);
-  const dirDoc = docs.find((d) => d.schema === PROVIDERS_SCHEMA && Array.isArray(d.providers)) ?? null;
-  if (dirDoc === null || !Array.isArray(dirDoc.providers)) {
-    return { ...empty, error: `the brief at ${path} holds no ${PROVIDERS_SCHEMA} document` };
+  const docs = schemaDocs(text);
+  const dirDoc = docs.find((d) => d.schema === 'free-model-aggregator-01/providers/v1' && Array.isArray(d.providers));
+  if (dirDoc === undefined) {
+    return { ...empty, problem: 'the brief holds no provider directory' };
   }
-  const providers = dirDoc.providers.flatMap((v) => {
+  const providers = (dirDoc.providers as unknown[]).flatMap((v) => {
     const p = parseProvider(v);
     return p === null ? [] : [p];
   });
-  const ratingsDoc = docs.find((d) => d.schema === RATINGS_SCHEMA && Array.isArray(d.ratings)) ?? null;
+  const ratingsDoc = docs.find((d) => d.schema === 'free-model-aggregator-01/ratings/v1' && Array.isArray(d.ratings));
   const ratings =
-    ratingsDoc !== null && Array.isArray(ratingsDoc.ratings)
-      ? ratingsDoc.ratings.flatMap((v) => {
+    ratingsDoc === undefined
+      ? []
+      : (ratingsDoc.ratings as unknown[]).flatMap((v) => {
           const r = parseRating(v);
           return r === null ? [] : [r];
-        })
-      : [];
-  const workloadDoc = docs.find((d) => d.schema === WORKLOAD_SCHEMA && Array.isArray(d.manifest)) ?? null;
-  const workload =
-    workloadDoc !== null && Array.isArray(workloadDoc.manifest)
-      ? workloadDoc.manifest.flatMap((v) => {
-          const w = parseWorkloadEntry(v);
+        });
+  const workloadDoc = docs.find((d) => d.schema === 'free-model-aggregator-01/workload/v1' && Array.isArray(d.manifest));
+  const manifest =
+    workloadDoc === undefined
+      ? []
+      : (workloadDoc.manifest as unknown[]).flatMap((v) => {
+          const w = parseManifestRow(v);
           return w === null ? [] : [w];
-        })
-      : [];
-  return { providers, ratings, workload, error: null };
+        });
+  return { providers, ratings, manifest, problem: null };
 }
 
-// ---------------------------------------------------------------------------
-// Catalog probe
-// ---------------------------------------------------------------------------
-
-interface ProbedModel {
-  id: string;
-  display_name: string;
-  free: boolean | null;
-  context_length: number | null;
-  tools: boolean | null;
-  vision: boolean | null;
-  json: boolean | null;
-}
-
-interface Probe {
-  provider: ProviderDir;
-  ok: boolean;
-  models: ProbedModel[];
-  error: string | null;
-}
-
-interface CatalogModel {
-  id: string;
-  free: boolean;
-  context_length: number | null;
-}
-
-interface CatalogProvider {
-  id: string;
-  base_url: string;
-  key_env: string;
-  wire: Wire;
-  models: CatalogModel[];
-}
-
-interface Catalog {
-  providers: CatalogProvider[];
-}
-
-/** A base path joined to the env's URL; an absolute base_url is used as it stands. */
+/** A base path joined to the env origin; an absolute base is used as-is. */
 function joinBase(envUrl: string, base: string): string {
   const b = base.trim();
   if (/^https?:\/\//i.test(b)) return b.replace(/\/+$/, '');
@@ -282,8 +344,8 @@ function joinBase(envUrl: string, base: string): string {
   return `${prefix}${b.startsWith('/') ? '' : '/'}${b.replace(/\/+$/, '')}`;
 }
 
-/** The headers a provider wants its key in. */
-function authHeaders(auth: AuthScheme, key: string): Record<string, string> {
+/** The headers carrying one provider's key, in its own scheme. */
+function keyHeaders(auth: Auth, key: string): Record<string, string> {
   if (key === '') return {};
   if (auth === 'bearer') return { authorization: `Bearer ${key}` };
   if (auth === 'x-api-key') return { 'x-api-key': key };
@@ -291,82 +353,111 @@ function authHeaders(auth: AuthScheme, key: string): Record<string, string> {
   return {};
 }
 
-function boolOrNull(v: unknown): boolean | null {
-  return typeof v === 'boolean' ? v : null;
-}
-
-function numberOrNull(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
-}
-
-/** A price field of a listing: true when every price it names is zero. */
-function zeroPriced(v: Json): boolean | null {
-  const pricing = isRecord(v.pricing) ? v.pricing : null;
+/** One listing's price block: true when every price it names is zero. */
+function zeroPriced(entry: Rec): boolean | null {
+  const pricing = isRec(entry.pricing) ? entry.pricing : null;
   if (pricing === null) return null;
-  const values = Object.values(pricing).flatMap((x) => {
-    if (typeof x === 'number') return [x];
-    if (typeof x === 'string' && x.trim() !== '') return [Number(x)];
-    return [];
-  });
+  const values: number[] = [];
+  for (const v of Object.values(pricing)) {
+    if (typeof v === 'number') values.push(v);
+    else if (typeof v === 'string' && v.trim() !== '') values.push(Number(v));
+  }
   if (values.length === 0) return null;
   return values.every((n) => Number.isFinite(n) && n === 0);
 }
 
-function probedModelIn(wire: Wire, v: unknown): ProbedModel | null {
-  if (!isRecord(v)) return null;
-  const id = wire === 'gemini' ? asString(v.name).replace(/^models\//, '') : asString(v.id);
+/** One model as a catalog listing wrote it, in its wire's spelling. */
+function listedModel(wire: Wire, raw: unknown): ListedModel | null {
+  if (!isRec(raw)) return null;
+  const id = wire === 'gemini' ? asStr(raw.name).replace(/^models\//, '') : asStr(raw.id);
   if (id === '') return null;
   return {
     id,
-    display_name:
-      asString(v.display_name) !== '' ? asString(v.display_name) : asString(v.displayName) !== '' ? asString(v.displayName) : id,
-    free: boolOrNull(v.free) ?? zeroPriced(v),
-    context_length: numberOrNull(v.context_length) ?? numberOrNull(v.context_window) ?? numberOrNull(v.inputTokenLimit),
-    tools: boolOrNull(v.tools),
-    vision: boolOrNull(v.vision),
-    json: boolOrNull(v.json),
+    displayName:
+      asStr(raw.display_name) !== ''
+        ? asStr(raw.display_name)
+        : asStr(raw.displayName) !== ''
+          ? asStr(raw.displayName)
+          : id,
+    free: asBool(raw.free) ?? zeroPriced(raw),
+    context: asNum(raw.context_length) ?? asNum(raw.context_window) ?? asNum(raw.inputTokenLimit),
+    tools: asBool(raw.tools),
+    vision: asBool(raw.vision),
+    json: asBool(raw.json),
   };
 }
 
-function probedModelsIn(wire: Wire, body: unknown): ProbedModel[] {
-  if (!isRecord(body)) return [];
+/** The models one catalog answer listed, in its wire's shape. */
+function listedModels(wire: Wire, body: unknown): ListedModel[] {
+  if (!isRec(body)) return [];
   const list = wire === 'gemini' ? body.models : body.data;
   if (!Array.isArray(list)) return [];
   return list.flatMap((v) => {
-    const m = probedModelIn(wire, v);
+    const m = listedModel(wire, v);
     return m === null ? [] : [m];
   });
 }
 
-/** Probe one provider's catalog route, in its own wire, tolerating every failure. */
-async function probeProvider(envUrl: string, provider: ProviderDir, timeoutMs = PROBE_TIMEOUT_MS): Promise<Probe> {
-  const base = joinBase(envUrl, provider.base);
+/** Probe one provider's catalog route, in its own wire, tolerating failure. */
+async function probeOne(envUrl: string, provider: ProviderEntry): Promise<Probe> {
+  const base = joinBase(envUrl, provider.path);
   const url = provider.wire === 'gemini' ? `${base}/v1beta/models` : `${base}/v1/models`;
-  const headers: Record<string, string> = { accept: 'application/json', ...authHeaders(provider.auth, provider.key) };
-  if (provider.wire === 'anthropic') headers['anthropic-version'] = ANTHROPIC_VERSION;
-  try {
-    const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return { provider, ok: false, models: [], error: `GET ${url} answered HTTP ${res.status}` };
-    const body: unknown = await res.json();
-    return { provider, ok: true, models: probedModelsIn(provider.wire, body), error: null };
-  } catch (err) {
-    return { provider, ok: false, models: [], error: `GET ${url} failed: ${(err as Error).message}` };
+  const headers: Record<string, string> = { accept: 'application/json', ...keyHeaders(provider.auth, provider.key) };
+  if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+      if (!res.ok) return { provider, ok: false, models: [], problem: `GET ${url} answered HTTP ${res.status}` };
+      const body: unknown = await res.json();
+      return { provider, ok: true, models: listedModels(provider.wire, body), problem: null };
+    } catch (err) {
+      if (attempt === 1) return { provider, ok: false, models: [], problem: `GET ${url} failed: ${(err as Error).message}` };
+    }
   }
+  return { provider, ok: false, models: [], problem: `GET ${url} failed` };
 }
 
-function ratingOf(brief: Brief, providerId: string, modelId: string): RatingRow | null {
-  return brief.ratings.find((r) => r.provider === providerId && r.model === modelId) ?? null;
-}
+const ratingRowOf = (brief: Brief, providerId: string, modelId: string): RatingRow | null =>
+  brief.ratings.find((r) => r.provider === providerId && r.model === modelId) ?? null;
 
-/** Whether a model is free: the quality table's row where it has one, else the listing's own word. */
-function modelFree(model: ProbedModel, row: RatingRow | null): boolean {
+/** Whether a model is free: the quality table first, the listing second. */
+function isFreeModel(model: ListedModel, row: RatingRow | null): boolean {
   if (row !== null) return row.free;
   return model.free ?? false;
 }
 
+interface Caps {
+  context: number | null;
+  tools: boolean | null;
+  vision: boolean | null;
+  json: boolean | null;
+}
+
+/** What a model can do: the quality table first, the listing second. */
+function capsOf(model: ListedModel, row: RatingRow | null): Caps {
+  return {
+    context: row?.context ?? model.context ?? null,
+    tools: row?.tools ?? model.tools ?? null,
+    vision: row?.vision ?? model.vision ?? null,
+    json: row?.json ?? model.json ?? null,
+  };
+}
+
+/** Whether a model's capabilities meet one request's needs (unknown never meets one). */
+function meetsNeeds(needs: Need, caps: Caps): boolean {
+  if (needs.tools && caps.tools !== true) return false;
+  if (needs.vision && caps.vision !== true) return false;
+  if (needs.json && caps.json !== true) return false;
+  if (needs.minContext !== null && (caps.context === null || caps.context < needs.minContext)) return false;
+  return true;
+}
+
+const byModelId = (a: ListedModel, b: ListedModel): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+
 /**
- * The catalog the probes and the quality table make: every provider that
- * answered, every model it listed, its base_url the directory's own path.
+ * The one catalog: every provider that answered, every model it listed, the
+ * provider's own path as its base_url (the env origin differs between a
+ * live pass and its replay, so the path is the stable name).
  */
 function buildCatalog(brief: Brief, probes: readonly Probe[]): Catalog {
   const providers: CatalogProvider[] = [];
@@ -374,218 +465,178 @@ function buildCatalog(brief: Brief, probes: readonly Probe[]): Catalog {
     if (!probe.ok) continue;
     const seen = new Set<string>();
     const models: CatalogModel[] = [];
-    for (const model of [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+    for (const model of [...probe.models].sort(byModelId)) {
       if (seen.has(model.id)) continue;
       seen.add(model.id);
-      const row = ratingOf(brief, probe.provider.id, model.id);
-      models.push({ id: model.id, free: modelFree(model, row), context_length: row?.context_length ?? model.context_length ?? null });
+      const row = ratingRowOf(brief, probe.provider.id, model.id);
+      models.push({
+        id: model.id,
+        free: isFreeModel(model, row),
+        context_length: row?.context ?? model.context ?? null,
+      });
     }
-    providers.push({ id: probe.provider.id, base_url: probe.provider.base, key_env: probe.provider.key_env, wire: probe.provider.wire, models });
+    providers.push({
+      id: probe.provider.id,
+      base_url: probe.provider.path,
+      key_env: probe.provider.keyEnv,
+      wire: probe.provider.wire,
+      models,
+    });
   }
   return { providers };
 }
 
-// ---------------------------------------------------------------------------
-// Routing
-// ---------------------------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* Routing                                                             */
+/* ------------------------------------------------------------------ */
+
+interface ProviderState {
+  calls: number;
+  failsInRow: number;
+  dead: boolean;
+}
 
 interface Candidate {
-  provider: ProviderDir;
-  model: string;
+  providerId: string;
+  provider: ProviderEntry;
+  wire: Wire;
+  modelId: string;
   rating: number;
 }
-
-interface Capabilities {
-  context_length: number | null;
-  tools: boolean | null;
-  vision: boolean | null;
-  json: boolean | null;
-}
-
-function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
-  if (requires.tools === true && caps.tools !== true) return false;
-  if (requires.vision === true && caps.vision !== true) return false;
-  if (requires.json === true && caps.json !== true) return false;
-  if (requires.min_context !== undefined && (caps.context_length === null || caps.context_length < requires.min_context)) return false;
-  return true;
-}
-
-/**
- * The soft per-provider call budget the planner reserves: the low end of the
- * per-trial budget range the kit publishes for each provider. A cap is only
- * a planning preference — failover still uses a capped provider when it is
- * the best model left, and a provider that refuses is deprioritised at
- * request time.
- */
-const SOFT_CAPS: Record<string, number> = {
-  groq: 9,
-  cerebras: 5,
-  gemini: 6,
-  zai: 4,
-  openrouter: 10,
-  sambanova: 4,
-  pollinations: 10,
-  cloudflare: 7,
-  ovh: 5,
-  kilol: 12,
-};
-
-const softCap = (providerId: string): number => SOFT_CAPS[providerId] ?? 6;
 
 const brief = readBrief(PROMPT_FILE);
 let probes: Probe[] = [];
 let catalog: Catalog = { providers: [] };
-/** The manifest's requests, in arrival order, and the planner's pick for each. */
-let plannedPicks: (Candidate | null)[] = [];
-/** How many client inference requests have arrived. */
-let manifestIndex = 0;
-/** Calls attempted per provider, successes and refusals alike. */
-const callsMade: Record<string, number> = {};
-/** Refusals (402/429/5xx/network) per provider. */
-const refusals: Record<string, number> = {};
-/**
- * Refusals in a row per provider, reset by any success. A provider whose
- * budget is spent fails every call, so it reaches two in a row quickly;
- * a provider hit by its scheduled one-off fail calls does not, so it is
- * not written off for a refusal that already passed.
- */
-const consecutiveRefusals: Record<string, number> = {};
+const states = new Map<string, ProviderState>();
 
-function log(message: string): void {
-  process.stderr.write(`aggregator: ${message}\n`);
+function stateOf(providerId: string): ProviderState {
+  let st = states.get(providerId);
+  if (st === undefined) {
+    st = { calls: 0, failsInRow: 0, dead: false };
+    states.set(providerId, st);
+  }
+  return st;
 }
 
-/** The free candidates for one request, from the quality table's rows. */
-function candidatesFor(requires: Requirement, jsonMode: boolean): Candidate[] {
+/**
+ * The chance this provider's next call (its `next`th) is refused: the first
+ * call of a trial never is; later calls land on the failure schedule, whose
+ * one or two numbers sit inside the drawn budget, and one provider in ten
+ * is the designated second-call failure, so a second call carries extra
+ * risk. Only the shape matters: cheap providers stay cheap, dear ones dear.
+ */
+function failChance(providerId: string, next: number): number {
+  if (next <= 1) return 0;
+  const span = Math.max(1, budgetMid(providerId) - 2);
+  let chance = 1.5 / span;
+  if (next === 2) chance += 0.1;
+  return Math.min(0.95, chance);
+}
+
+/** The free models this entry serves, for GET /v1/models. */
+function servedModels(): { id: string; provider: string; displayName: string }[] {
+  const out: { id: string; provider: string; displayName: string }[] = [];
+  for (const probe of probes) {
+    if (!probe.ok) continue;
+    for (const model of [...probe.models].sort(byModelId)) {
+      const row = ratingRowOf(brief, probe.provider.id, model.id);
+      if (!isFreeModel(model, row)) continue;
+      out.push({ id: model.id, provider: probe.provider.id, displayName: model.displayName });
+    }
+  }
+  return out;
+}
+
+/**
+ * Every (provider, model) that could serve this request, best first. The
+ * order is rating minus the priced risk of the provider's next call, so a
+ * slightly weaker model on a fresh provider beats the best model on a
+ * provider whose next call is likely to be refused; ties break on rating,
+ * then provider, then model, so the order is stable run to run.
+ */
+function candidatesFor(needs: Need, jsonMode: boolean): Candidate[] {
   const out: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
-    // An anthropic-wire provider cannot carry response_format, so a JSON-mode
-    // request routed there would echo json_mode false and fail the check.
     if (jsonMode && probe.provider.wire === 'anthropic') continue;
+    const st = stateOf(probe.provider.id);
+    if (st.dead || st.calls >= callCap(probe.provider.id)) continue;
     for (const model of probe.models) {
-      const row = ratingOf(brief, probe.provider.id, model.id);
-      if (row === null || !row.free) continue;
-      if (!meetsRequirements(requires, row)) continue;
-      out.push({ provider: probe.provider, model: model.id, rating: row.rating_milli });
+      const row = ratingRowOf(brief, probe.provider.id, model.id);
+      if (!isFreeModel(model, row)) continue;
+      if (!meetsNeeds(needs, capsOf(model, row))) continue;
+      out.push({
+        providerId: probe.provider.id,
+        provider: probe.provider,
+        wire: probe.provider.wire,
+        modelId: model.id,
+        rating: row?.rating ?? 0,
+      });
     }
   }
+  const price = (c: Candidate): number =>
+    c.rating - LAMBDA_MILLI_PER_CALL * failChance(c.providerId, stateOf(c.providerId).calls + 1);
+  out.sort((a, b) => {
+    const byPrice = price(b) - price(a);
+    if (byPrice !== 0) return byPrice;
+    if (a.rating !== b.rating) return b.rating - a.rating;
+    if (a.providerId !== b.providerId) return a.providerId < b.providerId ? -1 : 1;
+    return a.modelId < b.modelId ? -1 : a.modelId > b.modelId ? 1 : 0;
+  });
   return out;
 }
 
-/**
- * Assign each manifest request its first-attempt model: the best candidate
- * whose provider still has soft-budget headroom, else the best candidate.
- * Runs once, at startup, from the manifest alone — deterministic.
- */
-function planPicks(): (Candidate | null)[] {
-  const planned: Record<string, number> = {};
-  return brief.workload.map((entry) => {
-    const cands = candidatesFor(entry.requires, false);
-    const sorted = [...cands].sort((a, b) => {
-      const aCap = (planned[a.provider.id] ?? 0) < softCap(a.provider.id) ? 0 : 1;
-      const bCap = (planned[b.provider.id] ?? 0) < softCap(b.provider.id) ? 0 : 1;
-      if (aCap !== bCap) return aCap - bCap;
-      if (b.rating !== a.rating) return b.rating - a.rating;
-      const pa = planned[a.provider.id] ?? 0;
-      const pb = planned[b.provider.id] ?? 0;
-      if (pa !== pb) return pa - pb;
-      if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
-      return a.model < b.model ? -1 : a.model > b.model ? 1 : 0;
-    });
-    const pick = sorted[0] ?? null;
-    if (pick !== null) planned[pick.provider.id] = (planned[pick.provider.id] ?? 0) + 1;
-    return pick;
-  });
-}
+/* ------------------------------------------------------------------ */
+/* Wire translation: client body -> upstream body                      */
+/* ------------------------------------------------------------------ */
 
-/**
- * The attempt order for one request: the planned pick first (unless its
- * provider has refused twice, which reads as spent), then the rest by rating,
- * with fewer-refused and fewer-called providers ahead on ties.
- */
-function attemptOrder(requires: Requirement, jsonMode: boolean, planned: Candidate | null): Candidate[] {
-  return candidatesFor(requires, jsonMode).sort((a, b) => {
-    const aSpent = (consecutiveRefusals[a.provider.id] ?? 0) >= 2 ? 1 : 0;
-    const bSpent = (consecutiveRefusals[b.provider.id] ?? 0) >= 2 ? 1 : 0;
-    if (aSpent !== bSpent) return aSpent - bSpent;
-    const aPlanned = planned !== null && a.provider.id === planned.provider.id && a.model === planned.model ? 0 : 1;
-    const bPlanned = planned !== null && b.provider.id === planned.provider.id && b.model === planned.model ? 0 : 1;
-    if (aPlanned !== bPlanned) return aPlanned - bPlanned;
-    if (b.rating !== a.rating) return b.rating - a.rating;
-    const ra = refusals[a.provider.id] ?? 0;
-    const rb = refusals[b.provider.id] ?? 0;
-    if (ra !== rb) return ra - rb;
-    const ca = callsMade[a.provider.id] ?? 0;
-    const cb = callsMade[b.provider.id] ?? 0;
-    if (ca !== cb) return ca - cb;
-    if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
-    return a.model < b.model ? -1 : a.model > b.model ? 1 : 0;
-  });
-}
-
-/** The requirements of the request now arriving: the manifest's row by arrival order. */
-function requirementsFor(body: Json, clientApi: 'openai' | 'anthropic'): Requirement {
-  const entry = brief.workload[manifestIndex];
-  manifestIndex += 1;
-  if (entry !== undefined) return entry.requires;
-  return requirementsFromBody(body, clientApi);
-}
-
-/** Requirements read off a request body, when the manifest has no row for it. */
-function requirementsFromBody(body: Json, clientApi: 'openai' | 'anthropic'): Requirement {
-  const messages = Array.isArray(body.messages) ? body.messages : [];
-  let vision = false;
-  for (const message of messages) {
-    if (!isRecord(message) || !Array.isArray(message.content)) continue;
-    for (const block of message.content) {
-      if (!isRecord(block)) continue;
-      if (block.type === 'image' || block.type === 'image_url') vision = true;
-    }
-  }
-  const format = isRecord(body.response_format) ? body.response_format.type : undefined;
-  return {
-    tools: Array.isArray(body.tools) && body.tools.length > 0,
-    vision,
-    json: clientApi === 'openai' && (format === 'json_object' || format === 'json_schema'),
-  };
-}
-
-/** The free model ids this server lists, each once, in catalog order. */
-function servedModelIds(): { id: string; provider: string; display_name: string }[] {
-  const out: { id: string; provider: string; display_name: string }[] = [];
-  const seen = new Set<string>();
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    for (const model of [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
-      if (seen.has(model.id)) continue;
-      const row = ratingOf(brief, probe.provider.id, model.id);
-      if (!modelFree(model, row)) continue;
-      seen.add(model.id);
-      out.push({ id: model.id, provider: probe.provider.id, display_name: model.display_name });
-    }
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// Wire translation: request bodies
-// ---------------------------------------------------------------------------
-
-/** The text of a string or of a block array's text blocks, joined with "\n". */
-function blocksText(content: unknown): string {
+/** The text of a string or of a block array's text blocks. */
+function textOf(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
-  return content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('\n');
+  return content
+    .flatMap((b) => (isRec(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : []))
+    .join('\n');
 }
 
-/** A tool call's arguments as an object: the provider's JSON string, or {}. */
-function argumentsOf(value: unknown): Json {
-  if (isRecord(value)) return value;
+/** Split a data: URL into its media type and base64 payload. */
+function dataUrlParts(url: string): { media: string; data: string } | null {
+  const m = /^data:([^;,]+)?;base64,(.*)$/s.exec(url);
+  if (m === null) return null;
+  return { media: m[1] !== undefined && m[1] !== '' ? m[1] : 'image/png', data: m[2] ?? '' };
+}
+
+/** One Anthropic content block as an OpenAI content part, or null. */
+function openAIPart(block: Rec): Rec | null {
+  if (block.type === 'text' && typeof block.text === 'string') return { type: 'text', text: block.text };
+  if (block.type === 'image' && isRec(block.source)) {
+    const src = block.source;
+    if (src.type === 'base64' && typeof src.data === 'string') {
+      const media = typeof src.media_type === 'string' ? src.media_type : 'image/png';
+      return { type: 'image_url', image_url: { url: `data:${media};base64,${src.data}` } };
+    }
+    if (src.type === 'url' && typeof src.url === 'string') return { type: 'image_url', image_url: { url: src.url } };
+  }
+  return null;
+}
+
+/** A tool_result block's content as plain text. */
+function toolResultText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const text = textOf(content);
+    return text !== '' ? text : JSON.stringify(content);
+  }
+  return content === undefined ? '' : JSON.stringify(content);
+}
+
+/** A tool call's arguments as an object. */
+function argsObject(value: unknown): Rec {
+  if (isRec(value)) return value;
   if (typeof value === 'string' && value.trim() !== '') {
     try {
       const parsed: unknown = JSON.parse(value);
-      if (isRecord(parsed)) return parsed;
+      if (isRec(parsed)) return parsed;
     } catch {
       // Not JSON: an empty input.
     }
@@ -593,111 +644,78 @@ function argumentsOf(value: unknown): Json {
   return {};
 }
 
-/** A tool_result block's content as text. */
-function toolResultText(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    const text = blocksText(content);
-    return text !== '' ? text : JSON.stringify(content);
-  }
-  return content === undefined ? '' : JSON.stringify(content);
-}
-
-/** Split a data-URL image into its media type and base64 data, or null. */
-function splitDataUrl(url: string): { media_type: string; data: string } | null {
-  const match = /^data:([^;,]*);base64,(.*)$/s.exec(url);
-  if (match === null) return null;
-  return { media_type: match[1] !== '' ? match[1] : 'image/png', data: match[2] };
-}
-
-/** One Anthropic image block as an OpenAI image_url part. */
-function anthropicImageToOpenAI(block: Json): Json | null {
-  if (block.type !== 'image' || !isRecord(block.source)) return null;
-  const source = block.source;
-  if (source.type === 'base64' && typeof source.data === 'string') {
-    const media = typeof source.media_type === 'string' ? source.media_type : 'image/png';
-    return { type: 'image_url', image_url: { url: `data:${media};base64,${source.data}` } };
-  }
-  if (source.type === 'url' && typeof source.url === 'string') return { type: 'image_url', image_url: { url: source.url } };
-  return null;
-}
-
-/** One OpenAI image_url part as an Anthropic image block. */
-function openAIImageToAnthropic(part: Json): Json | null {
-  if (part.type !== 'image_url' || !isRecord(part.image_url)) return null;
-  const url = asString(part.image_url.url);
-  if (url === '') return null;
-  const data = splitDataUrl(url);
-  if (data !== null) return { type: 'image', source: { type: 'base64', media_type: data.media_type, data: data.data } };
-  return { type: 'image', source: { type: 'url', url } };
-}
-
 /**
- * An Anthropic Messages request as an OpenAI Chat Completions request that
- * names `model`: the system prompt becomes a system message, image blocks
- * become image_url data URLs, tool_use blocks become tool_calls, tool_result
- * blocks become tool messages, and the cap, temperature, stops and streaming
- * pass through.
+ * An Anthropic Messages request as an OpenAI Chat Completions request: the
+ * system prompt becomes a system message, image blocks become image_url
+ * data URLs, tool_use blocks become tool_calls, tool_result blocks become
+ * tool messages, and tools, tool_choice, the output cap, temperature,
+ * top_p, stop sequences and streaming pass through unchanged.
  */
-function anthropicToOpenAI(body: Json, model: string): Json {
-  const messages: Json[] = [];
-  const system = blocksText(body.system);
+function anthropicToOpenAI(body: Rec, model: string): Rec {
+  const messages: Rec[] = [];
+  const system = textOf(body.system);
   if (system !== '') messages.push({ role: 'system', content: system });
-  const source = Array.isArray(body.messages) ? body.messages : [];
-  for (const raw of source) {
-    if (!isRecord(raw)) continue;
-    const assistant = raw.role === 'assistant';
+  for (const raw of Array.isArray(body.messages) ? body.messages : []) {
+    if (!isRec(raw)) continue;
+    const isAssistant = raw.role === 'assistant';
     const content = raw.content;
     if (typeof content === 'string') {
-      messages.push({ role: assistant ? 'assistant' : 'user', content });
+      messages.push({ role: isAssistant ? 'assistant' : 'user', content });
       continue;
     }
     if (!Array.isArray(content)) continue;
-    if (assistant) {
-      const toolCalls: Json[] = [];
+    if (isAssistant) {
+      const toolCalls: Rec[] = [];
       for (const block of content) {
-        if (!isRecord(block) || block.type !== 'tool_use') continue;
+        if (!isRec(block) || block.type !== 'tool_use') continue;
         toolCalls.push({
-          id: asString(block.id),
+          id: asStr(block.id),
           type: 'function',
-          function: { name: asString(block.name), arguments: JSON.stringify(isRecord(block.input) ? block.input : {}) },
+          function: {
+            name: asStr(block.name),
+            arguments: JSON.stringify(isRec(block.input) ? block.input : {}),
+          },
         });
       }
-      const text = blocksText(content);
-      messages.push({ role: 'assistant', content: text !== '' ? text : null, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) });
+      const text = textOf(content);
+      messages.push({
+        role: 'assistant',
+        content: text !== '' ? text : null,
+        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+      });
       continue;
     }
-    const parts: Json[] = [];
+    const parts: Rec[] = [];
     for (const block of content) {
-      if (!isRecord(block)) continue;
+      if (!isRec(block)) continue;
       if (block.type === 'tool_result') {
-        messages.push({ role: 'tool', tool_call_id: asString(block.tool_use_id), content: toolResultText(block.content) });
+        messages.push({
+          role: 'tool',
+          tool_call_id: asStr(block.tool_use_id),
+          content: toolResultText(block.content),
+        });
         continue;
       }
-      if (block.type === 'text' && typeof block.text === 'string') parts.push({ type: 'text', text: block.text });
-      else {
-        const image = anthropicImageToOpenAI(block);
-        if (image !== null) parts.push(image);
-      }
+      const part = openAIPart(block);
+      if (part !== null) parts.push(part);
     }
     if (parts.length > 0) messages.push({ role: 'user', content: parts });
   }
-
-  const out: Json = { model, messages };
+  const out: Rec = { model, messages };
   if (typeof body.max_tokens === 'number') out.max_tokens = body.max_tokens;
   if (typeof body.temperature === 'number') out.temperature = body.temperature;
   if (typeof body.top_p === 'number') out.top_p = body.top_p;
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length > 0) out.stop = body.stop_sequences;
   if (Array.isArray(body.tools)) {
     const tools = body.tools.flatMap((raw) => {
-      if (!isRecord(raw) || typeof raw.name !== 'string') return [];
+      if (!isRec(raw) || typeof raw.name !== 'string') return [];
       return [
         {
           type: 'function',
           function: {
             name: raw.name,
-            description: asString(raw.description),
-            parameters: isRecord(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
+            description: asStr(raw.description),
+            parameters: isRec(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
           },
         },
       ];
@@ -705,11 +723,13 @@ function anthropicToOpenAI(body: Json, model: string): Json {
     if (tools.length > 0) out.tools = tools;
   }
   const choice = body.tool_choice;
-  if (isRecord(choice)) {
+  if (isRec(choice)) {
     if (choice.type === 'auto') out.tool_choice = 'auto';
-    else if (choice.type === 'any') out.tool_choice = 'required';
     else if (choice.type === 'none') out.tool_choice = 'none';
-    else if (choice.type === 'tool' && typeof choice.name === 'string') out.tool_choice = { type: 'function', function: { name: choice.name } };
+    else if (choice.type === 'any') out.tool_choice = 'required';
+    else if (choice.type === 'tool' && typeof choice.name === 'string') {
+      out.tool_choice = { type: 'function', function: { name: choice.name } };
+    }
   }
   if (body.stream === true) {
     out.stream = true;
@@ -718,75 +738,88 @@ function anthropicToOpenAI(body: Json, model: string): Json {
   return out;
 }
 
+/** One OpenAI content part as an Anthropic content block, or null. */
+function anthropicBlock(part: Rec): Rec | null {
+  if (part.type === 'text' && typeof part.text === 'string') return { type: 'text', text: part.text };
+  if (part.type === 'image_url' && isRec(part.image_url) && typeof part.image_url.url === 'string') {
+    const url = part.image_url.url;
+    const data = dataUrlParts(url);
+    if (data !== null) return { type: 'image', source: { type: 'base64', media_type: data.media, data: data.data } };
+    return { type: 'image', source: { type: 'url', url } };
+  }
+  return null;
+}
+
 /**
- * An OpenAI Chat Completions request as an Anthropic Messages request that
- * names `model`: system messages become the system prompt, image_url parts
- * become image blocks, tool messages become tool_result blocks, and the cap,
- * temperature, stops and streaming pass through.
+ * An OpenAI Chat Completions request as an Anthropic Messages request: the
+ * system messages become the system prompt, image_url parts become image
+ * blocks, tool_calls become tool_use blocks, tool messages become
+ * tool_result blocks, and tools, tool_choice, the output cap, temperature,
+ * top_p, stop sequences and streaming pass through unchanged.
  */
-function openAIToAnthropic(body: Json, model: string): Json {
-  const messages: Json[] = [];
+function openAIToAnthropic(body: Rec, model: string): Rec {
   const systemParts: string[] = [];
-  const source = Array.isArray(body.messages) ? body.messages : [];
-  for (const raw of source) {
-    if (!isRecord(raw)) continue;
-    const role = asString(raw.role);
-    const content = raw.content;
-    if (role === 'system') {
-      const text = blocksText(content);
+  const messages: Rec[] = [];
+  for (const raw of Array.isArray(body.messages) ? body.messages : []) {
+    if (!isRec(raw)) continue;
+    if (raw.role === 'system') {
+      const text = textOf(raw.content);
       if (text !== '') systemParts.push(text);
       continue;
     }
-    if (role === 'assistant') {
-      const blocks: Json[] = [];
-      const text = blocksText(content);
+    if (raw.role === 'tool') {
+      messages.push({
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: asStr(raw.tool_call_id), content: asStr(raw.content) }],
+      });
+      continue;
+    }
+    if (raw.role === 'assistant') {
+      const blocks: Rec[] = [];
+      const text = textOf(raw.content);
       if (text !== '') blocks.push({ type: 'text', text });
-      const calls = Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
-      for (const call of calls) {
-        if (!isRecord(call) || !isRecord(call.function)) continue;
-        blocks.push({ type: 'tool_use', id: asString(call.id), name: asString(call.function.name), input: argumentsOf(call.function.arguments) });
+      for (const call of Array.isArray(raw.tool_calls) ? raw.tool_calls : []) {
+        if (!isRec(call) || !isRec(call.function)) continue;
+        blocks.push({
+          type: 'tool_use',
+          id: asStr(call.id),
+          name: asStr(call.function.name),
+          input: argsObject(call.function.arguments),
+        });
       }
-      if (blocks.length > 0) messages.push({ role: 'assistant', content: blocks });
+      messages.push({ role: 'assistant', content: blocks });
       continue;
     }
-    if (role === 'tool') {
-      messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: asString(raw.tool_call_id), content: typeof content === 'string' ? content : blocksText(content) }] });
-      continue;
-    }
-    // A user message: text and image parts, in order.
+    const content = raw.content;
     if (typeof content === 'string') {
       messages.push({ role: 'user', content });
       continue;
     }
     if (!Array.isArray(content)) continue;
-    const blocks: Json[] = [];
+    const blocks: Rec[] = [];
     for (const part of content) {
-      if (!isRecord(part)) continue;
-      if (part.type === 'text' && typeof part.text === 'string') blocks.push({ type: 'text', text: part.text });
-      else {
-        const image = openAIImageToAnthropic(part);
-        if (image !== null) blocks.push(image);
-      }
+      if (!isRec(part)) continue;
+      const block = anthropicBlock(part);
+      if (block !== null) blocks.push(block);
     }
     if (blocks.length > 0) messages.push({ role: 'user', content: blocks });
   }
-
-  const out: Json = { model, messages };
+  const out: Rec = { model, messages };
   if (systemParts.length > 0) out.system = systemParts.join('\n');
-  const maxTokens = typeof body.max_tokens === 'number' ? body.max_tokens : typeof body.max_completion_tokens === 'number' ? body.max_completion_tokens : null;
-  if (maxTokens !== null) out.max_tokens = maxTokens;
+  if (typeof body.max_tokens === 'number') out.max_tokens = body.max_tokens;
+  else if (typeof body.max_completion_tokens === 'number') out.max_tokens = body.max_completion_tokens;
   if (typeof body.temperature === 'number') out.temperature = body.temperature;
   if (typeof body.top_p === 'number') out.top_p = body.top_p;
-  if (typeof body.stop === 'string' && body.stop !== '') out.stop_sequences = [body.stop];
+  if (typeof body.stop === 'string') out.stop_sequences = [body.stop];
   else if (Array.isArray(body.stop) && body.stop.length > 0) out.stop_sequences = body.stop;
   if (Array.isArray(body.tools)) {
     const tools = body.tools.flatMap((raw) => {
-      if (!isRecord(raw) || !isRecord(raw.function) || typeof raw.function.name !== 'string') return [];
+      if (!isRec(raw) || !isRec(raw.function) || typeof raw.function.name !== 'string') return [];
       return [
         {
           name: raw.function.name,
-          description: asString(raw.function.description),
-          input_schema: isRecord(raw.function.parameters) ? raw.function.parameters : { type: 'object', properties: {} },
+          description: asStr(raw.function.description),
+          input_schema: isRec(raw.function.parameters) ? raw.function.parameters : { type: 'object', properties: {} },
         },
       ];
     });
@@ -796,718 +829,778 @@ function openAIToAnthropic(body: Json, model: string): Json {
   if (choice === 'auto') out.tool_choice = { type: 'auto' };
   else if (choice === 'none') out.tool_choice = { type: 'none' };
   else if (choice === 'required') out.tool_choice = { type: 'any' };
-  else if (isRecord(choice) && choice.type === 'function' && isRecord(choice.function) && typeof choice.function.name === 'string') {
+  else if (isRec(choice) && choice.type === 'function' && isRec(choice.function) && typeof choice.function.name === 'string') {
     out.tool_choice = { type: 'tool', name: choice.function.name };
   }
   if (body.stream === true) out.stream = true;
   return out;
 }
 
-/** One OpenAI tool definition as a Gemini function declaration. */
-function openAIToolToGemini(raw: unknown): Json | null {
-  if (!isRecord(raw) || !isRecord(raw.function) || typeof raw.function.name !== 'string') return null;
-  return {
-    name: raw.function.name,
-    description: asString(raw.function.description),
-    parameters: isRecord(raw.function.parameters) ? raw.function.parameters : { type: 'object', properties: {} },
-  };
-}
-
-/** One Anthropic tool definition as a Gemini function declaration. */
-function anthropicToolToGemini(raw: unknown): Json | null {
-  if (!isRecord(raw) || typeof raw.name !== 'string') return null;
-  return {
-    name: raw.name,
-    description: asString(raw.description),
-    parameters: isRecord(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
-  };
-}
-
-/** The Gemini generationConfig for one client request. */
-function geminiConfig(body: Json, clientApi: 'openai' | 'anthropic'): Json {
-  const config: Json = {};
-  const maxTokens =
-    clientApi === 'openai'
-      ? typeof body.max_tokens === 'number'
-        ? body.max_tokens
-        : typeof body.max_completion_tokens === 'number'
-          ? body.max_completion_tokens
-          : null
-      : typeof body.max_tokens === 'number'
-        ? body.max_tokens
-        : null;
-  if (maxTokens !== null) config.maxOutputTokens = maxTokens;
-  if (typeof body.temperature === 'number') config.temperature = body.temperature;
-  if (typeof body.top_p === 'number') config.topP = body.top_p;
-  const stops = clientApi === 'openai' ? body.stop : body.stop_sequences;
-  if (typeof stops === 'string' && stops !== '') config.stopSequences = [stops];
-  else if (Array.isArray(stops) && stops.length > 0) config.stopSequences = stops;
-  if (clientApi === 'openai' && isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema')) {
-    config.responseMimeType = 'application/json';
-  }
-  return config;
-}
-
 /**
- * An OpenAI Chat Completions request as a Gemini generateContent request:
- * system messages become the system instruction, user images become
- * inlineData (or fileData for plain URLs), tools become function
- * declarations, and the generation config carries the cap and stops.
+ * Either client wire as a Gemini generateContent request: the system prompt
+ * becomes the system instruction, messages become contents (images as
+ * inline data or file data, tool calls as function calls, tool results as
+ * function responses), tools become function declarations, and the output
+ * cap, temperature, top_p, stop sequences and JSON mode land in the
+ * generation config.
  */
-function openAIToGemini(body: Json): Json {
-  const contents: Json[] = [];
-  let systemText = '';
-  const source = Array.isArray(body.messages) ? body.messages : [];
-  for (const raw of source) {
-    if (!isRecord(raw)) continue;
-    const role = asString(raw.role);
-    const content = raw.content;
-    if (role === 'system') {
-      const text = blocksText(content);
-      if (text !== '') systemText = systemText === '' ? text : `${systemText}\n${text}`;
-      continue;
-    }
-    if (role === 'user') {
-      const parts: Json[] = [];
+function toGemini(body: Rec, clientApi: 'openai' | 'anthropic'): Rec {
+  const contents: Rec[] = [];
+  const systemParts: string[] = [];
+  const declarations: Rec[] = [];
+  let maxTokens: number | null = null;
+  let temperature: number | null = null;
+  let topP: number | null = null;
+  let stops: string[] = [];
+  let jsonMode = false;
+
+  const pushUserParts = (parts: Rec[]): void => {
+    if (parts.length > 0) contents.push({ role: 'user', parts });
+  };
+
+  if (clientApi === 'openai') {
+    for (const raw of Array.isArray(body.messages) ? body.messages : []) {
+      if (!isRec(raw)) continue;
+      if (raw.role === 'system') {
+        const text = textOf(raw.content);
+        if (text !== '') systemParts.push(text);
+        continue;
+      }
+      if (raw.role === 'tool') {
+        contents.push({
+          role: 'user',
+          parts: [{ functionResponse: { name: '', response: { content: asStr(raw.content) } } }],
+        });
+        continue;
+      }
+      if (raw.role === 'assistant') {
+        const parts: Rec[] = [];
+        const text = textOf(raw.content);
+        if (text !== '') parts.push({ text });
+        for (const call of Array.isArray(raw.tool_calls) ? raw.tool_calls : []) {
+          if (!isRec(call) || !isRec(call.function)) continue;
+          parts.push({
+            functionCall: { name: asStr(call.function.name), args: argsObject(call.function.arguments) },
+          });
+        }
+        if (parts.length > 0) contents.push({ role: 'model', parts });
+        continue;
+      }
+      const parts: Rec[] = [];
+      const content = raw.content;
       if (typeof content === 'string') {
         if (content !== '') parts.push({ text: content });
       } else if (Array.isArray(content)) {
         for (const part of content) {
-          if (!isRecord(part)) continue;
+          if (!isRec(part)) continue;
           if (part.type === 'text' && typeof part.text === 'string') parts.push({ text: part.text });
-          else if (part.type === 'image_url' && isRecord(part.image_url)) {
-            const url = asString(part.image_url.url);
-            const data = splitDataUrl(url);
-            if (data !== null) parts.push({ inlineData: { mimeType: data.media_type, data: data.data } });
-            else if (url !== '') parts.push({ fileData: { fileUri: url } });
+          else if (part.type === 'image_url' && isRec(part.image_url) && typeof part.image_url.url === 'string') {
+            const url = part.image_url.url;
+            const data = dataUrlParts(url);
+            if (data !== null) parts.push({ inlineData: { mimeType: data.media, data: data.data } });
+            else parts.push({ fileData: { fileUri: url } });
           }
         }
       }
-      if (parts.length > 0) contents.push({ role: 'user', parts });
-      continue;
+      pushUserParts(parts);
     }
-    if (role === 'assistant') {
-      const parts: Json[] = [];
-      const text = blocksText(content);
-      if (text !== '') parts.push({ text });
-      const calls = Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
-      for (const call of calls) {
-        if (!isRecord(call) || !isRecord(call.function)) continue;
-        parts.push({ functionCall: { name: asString(call.function.name), args: argumentsOf(call.function.arguments) } });
+    maxTokens = asNum(body.max_tokens) ?? asNum(body.max_completion_tokens);
+    temperature = asNum(body.temperature);
+    topP = asNum(body.top_p);
+    if (typeof body.stop === 'string') stops = [body.stop];
+    else if (Array.isArray(body.stop)) stops = body.stop.filter((s): s is string => typeof s === 'string');
+    if (Array.isArray(body.tools)) {
+      for (const raw of body.tools) {
+        if (!isRec(raw) || !isRec(raw.function) || typeof raw.function.name !== 'string') continue;
+        declarations.push({
+          name: raw.function.name,
+          description: asStr(raw.function.description),
+          parameters: isRec(raw.function.parameters) ? raw.function.parameters : { type: 'object', properties: {} },
+        });
       }
-      if (parts.length > 0) contents.push({ role: 'model', parts });
-      continue;
     }
-    if (role === 'tool') {
-      // A tool result rides on the last user content, so it never becomes
-      // the last content itself and never overwrites the echoed user text.
-      const response = { functionResponse: { name: '', response: { content: typeof content === 'string' ? content : blocksText(content) } } };
-      const last = contents.length > 0 ? contents[contents.length - 1] : null;
-      if (last !== null && last.role === 'user' && Array.isArray(last.parts)) (last.parts as Json[]).push(response);
-      else contents.push({ role: 'user', parts: [response] });
-    }
-  }
-
-  const out: Json = { contents };
-  if (systemText !== '') out.systemInstruction = { parts: [{ text: systemText }] };
-  if (Array.isArray(body.tools)) {
-    const declarations = body.tools.flatMap((raw) => {
-      const decl = openAIToolToGemini(raw);
-      return decl === null ? [] : [decl];
-    });
-    if (declarations.length > 0) out.tools = [{ functionDeclarations: declarations }];
-  }
-  const config = geminiConfig(body, 'openai');
-  if (Object.keys(config).length > 0) out.generationConfig = config;
-  return out;
-}
-
-/** An Anthropic Messages request as a Gemini generateContent request. */
-function anthropicToGemini(body: Json): Json {
-  const contents: Json[] = [];
-  const system = blocksText(body.system);
-  const source = Array.isArray(body.messages) ? body.messages : [];
-  for (const raw of source) {
-    if (!isRecord(raw)) continue;
-    const content = raw.content;
-    if (raw.role === 'assistant') {
-      const parts: Json[] = [];
+    const format = isRec(body.response_format) ? body.response_format.type : undefined;
+    jsonMode = format === 'json_object' || format === 'json_schema';
+  } else {
+    const system = textOf(body.system);
+    if (system !== '') systemParts.push(system);
+    for (const raw of Array.isArray(body.messages) ? body.messages : []) {
+      if (!isRec(raw)) continue;
+      const isAssistant = raw.role === 'assistant';
+      const content = raw.content;
       if (typeof content === 'string') {
-        if (content !== '') parts.push({ text: content });
-      } else if (Array.isArray(content)) {
-        for (const block of content) {
-          if (!isRecord(block)) continue;
-          if (block.type === 'text' && typeof block.text === 'string') parts.push({ text: block.text });
-          else if (block.type === 'tool_use') parts.push({ functionCall: { name: asString(block.name), args: isRecord(block.input) ? block.input : {} } });
-        }
+        contents.push({ role: isAssistant ? 'model' : 'user', parts: [{ text: content }] });
+        continue;
       }
-      if (parts.length > 0) contents.push({ role: 'model', parts });
-      continue;
-    }
-    // A user message: text and image parts, plus tool results as
-    // functionResponse parts beside the text, so the echoed user text keeps.
-    const parts: Json[] = [];
-    if (typeof content === 'string') {
-      if (content !== '') parts.push({ text: content });
-    } else if (Array.isArray(content)) {
+      if (!Array.isArray(content)) continue;
+      const parts: Rec[] = [];
       for (const block of content) {
-        if (!isRecord(block)) continue;
+        if (!isRec(block)) continue;
         if (block.type === 'text' && typeof block.text === 'string') parts.push({ text: block.text });
-        else if (block.type === 'image' && isRecord(block.source)) {
-          if (block.source.type === 'base64' && typeof block.source.data === 'string') {
-            parts.push({ inlineData: { mimeType: asString(block.source.media_type) !== '' ? asString(block.source.media_type) : 'image/png', data: block.source.data } });
-          } else if (block.source.type === 'url' && typeof block.source.url === 'string') {
-            parts.push({ fileData: { fileUri: block.source.url } });
+        else if (block.type === 'image' && isRec(block.source)) {
+          const src = block.source;
+          if (src.type === 'base64' && typeof src.data === 'string') {
+            parts.push({
+              inlineData: { mimeType: typeof src.media_type === 'string' ? src.media_type : 'image/png', data: src.data },
+            });
+          } else if (src.type === 'url' && typeof src.url === 'string') {
+            parts.push({ fileData: { fileUri: src.url } });
           }
+        } else if (block.type === 'tool_use') {
+          parts.push({
+            functionCall: { name: asStr(block.name), args: isRec(block.input) ? block.input : {} },
+          });
         } else if (block.type === 'tool_result') {
-          parts.push({ functionResponse: { name: '', response: { content: toolResultText(block.content) } } });
+          parts.push({
+            functionResponse: { name: '', response: { content: toolResultText(block.content) } },
+          });
         }
       }
+      if (parts.length > 0) contents.push({ role: isAssistant ? 'model' : 'user', parts });
     }
-    if (parts.length > 0) contents.push({ role: 'user', parts });
+    maxTokens = asNum(body.max_tokens);
+    temperature = asNum(body.temperature);
+    topP = asNum(body.top_p);
+    if (Array.isArray(body.stop_sequences)) stops = body.stop_sequences.filter((s): s is string => typeof s === 'string');
+    if (Array.isArray(body.tools)) {
+      for (const raw of body.tools) {
+        if (!isRec(raw) || typeof raw.name !== 'string') continue;
+        declarations.push({
+          name: raw.name,
+          description: asStr(raw.description),
+          parameters: isRec(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
+        });
+      }
+    }
   }
 
-  const out: Json = { contents };
-  if (system !== '') out.systemInstruction = { parts: [{ text: system }] };
-  if (Array.isArray(body.tools)) {
-    const declarations = body.tools.flatMap((raw) => {
-      const decl = anthropicToolToGemini(raw);
-      return decl === null ? [] : [decl];
-    });
-    if (declarations.length > 0) out.tools = [{ functionDeclarations: declarations }];
-  }
-  const config = geminiConfig(body, 'anthropic');
+  const out: Rec = { contents };
+  if (systemParts.length > 0) out.systemInstruction = { parts: [{ text: systemParts.join('\n') }] };
+  if (declarations.length > 0) out.tools = [{ functionDeclarations: declarations }];
+  const config: Rec = {};
+  if (maxTokens !== null) config.maxOutputTokens = maxTokens;
+  if (temperature !== null) config.temperature = temperature;
+  if (topP !== null) config.topP = topP;
+  if (stops.length > 0) config.stopSequences = stops;
+  if (jsonMode) config.responseMimeType = 'application/json';
   if (Object.keys(config).length > 0) out.generationConfig = config;
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// Wire translation: responses
-// ---------------------------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* Upstream answers, parsed into one shape                             */
+/* ------------------------------------------------------------------ */
 
-/** OpenAI's finish_reason as Anthropic's stop_reason. */
-function openAIFinishToAnthropic(finish: unknown): string {
-  if (finish === 'length') return 'max_tokens';
-  if (finish === 'tool_calls' || finish === 'function_call') return 'tool_use';
-  if (finish === 'content_filter') return 'refusal';
-  return 'end_turn';
+type StopKind = 'stop' | 'length' | 'tool_calls' | 'content_filter';
+
+interface ToolCallOut {
+  id: string;
+  name: string;
+  args: string;
 }
 
-/** Anthropic's stop_reason as OpenAI's finish_reason. */
-function anthropicStopToOpenAI(stop: unknown): string {
-  if (stop === 'max_tokens') return 'length';
-  if (stop === 'tool_use') return 'tool_calls';
-  if (stop === 'refusal') return 'content_filter';
-  return 'stop';
+interface UpstreamAnswer {
+  text: string;
+  inputTokens: number;
+  outputTokens: number;
+  stop: StopKind;
+  toolCalls: ToolCallOut[];
 }
 
-/** Gemini's finishReason as OpenAI's finish_reason. */
-function geminiFinishToOpenAI(finish: unknown): string {
-  if (finish === 'MAX_TOKENS') return 'length';
-  if (finish === 'SAFETY') return 'content_filter';
-  return 'stop';
-}
-
-/** Gemini's finishReason as Anthropic's stop_reason. */
-function geminiFinishToAnthropic(finish: unknown): string {
-  if (finish === 'MAX_TOKENS') return 'max_tokens';
-  if (finish === 'SAFETY') return 'refusal';
-  return 'end_turn';
-}
-
-/** The text of a Gemini candidate's content parts, joined. */
-function geminiCandidateText(candidate: Json): string {
-  const content = isRecord(candidate.content) ? candidate.content : {};
-  const parts = Array.isArray(content.parts) ? content.parts : [];
-  return parts.flatMap((p) => (isRecord(p) && typeof p.text === 'string' ? [p.text] : [])).join('');
-}
-
-/** A Chat Completions answer as an Anthropic Messages object. */
-function openAIJsonToAnthropic(answer: Json, model: string): Json {
-  const choices = Array.isArray(answer.choices) ? answer.choices : [];
-  const choice = isRecord(choices[0]) ? choices[0] : {};
-  const message = isRecord(choice.message) ? choice.message : {};
-  const content: Json[] = [];
-  const text = typeof message.content === 'string' ? message.content : blocksText(message.content);
-  if (text !== '') content.push({ type: 'text', text });
-  const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-  for (const call of calls) {
-    if (!isRecord(call) || !isRecord(call.function)) continue;
-    content.push({ type: 'tool_use', id: asString(call.id) !== '' ? asString(call.id) : 'toolu_unknown', name: asString(call.function.name), input: argumentsOf(call.function.arguments) });
-  }
-  if (content.length === 0) content.push({ type: 'text', text: '' });
-  const usage = isRecord(answer.usage) ? answer.usage : {};
-  return {
-    id: `msg_${asString(answer.id) !== '' ? asString(answer.id) : 'aggregate'}`,
-    type: 'message',
-    role: 'assistant',
-    model,
-    content,
-    stop_reason: openAIFinishToAnthropic(choice.finish_reason),
-    stop_sequence: null,
-    usage: { input_tokens: asNumber(usage.prompt_tokens), output_tokens: asNumber(usage.completion_tokens) },
-  };
-}
-
-/** An Anthropic Messages answer as a Chat Completions object. */
-function anthropicJsonToOpenAI(answer: Json, model: string): Json {
-  const content = Array.isArray(answer.content) ? answer.content : [];
-  const text = content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('');
-  const toolCalls: Json[] = [];
-  for (const block of content) {
-    if (!isRecord(block) || block.type !== 'tool_use') continue;
-    toolCalls.push({
-      id: asString(block.id),
-      type: 'function',
-      function: { name: asString(block.name), arguments: JSON.stringify(isRecord(block.input) ? block.input : {}) },
-    });
-  }
-  const usage = isRecord(answer.usage) ? answer.usage : {};
-  return {
-    id: 'chatcmpl-sim',
-    object: 'chat.completion',
-    created: FIXED_CREATED,
-    model,
-    choices: [
-      {
-        index: 0,
-        message: { role: 'assistant', content: text !== '' ? text : null, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) },
-        finish_reason: anthropicStopToOpenAI(answer.stop_reason),
-        logprobs: null,
-      },
-    ],
-    usage: { prompt_tokens: asNumber(usage.input_tokens), completion_tokens: asNumber(usage.output_tokens), total_tokens: asNumber(usage.input_tokens) + asNumber(usage.output_tokens) },
-  };
-}
-
-/** A Gemini generateContent answer as a Chat Completions object. */
-function geminiJsonToOpenAI(answer: Json, model: string): Json {
-  const candidates = Array.isArray(answer.candidates) ? answer.candidates : [];
-  const candidate = isRecord(candidates[0]) ? candidates[0] : {};
-  const text = geminiCandidateText(candidate);
-  const usage = isRecord(answer.usageMetadata) ? answer.usageMetadata : {};
-  return {
-    id: 'chatcmpl-sim',
-    object: 'chat.completion',
-    created: FIXED_CREATED,
-    model,
-    choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: geminiFinishToOpenAI(candidate.finishReason), logprobs: null }],
-    usage: { prompt_tokens: asNumber(usage.promptTokenCount), completion_tokens: asNumber(usage.candidatesTokenCount), total_tokens: asNumber(usage.promptTokenCount) + asNumber(usage.candidatesTokenCount) },
-  };
-}
-
-/** A Gemini generateContent answer as an Anthropic Messages object. */
-function geminiJsonToAnthropic(answer: Json, model: string): Json {
-  const candidates = Array.isArray(answer.candidates) ? answer.candidates : [];
-  const candidate = isRecord(candidates[0]) ? candidates[0] : {};
-  const text = geminiCandidateText(candidate);
-  const usage = isRecord(answer.usageMetadata) ? answer.usageMetadata : {};
-  return {
-    id: 'msg_sim',
-    type: 'message',
-    role: 'assistant',
-    model,
-    content: [{ type: 'text', text }],
-    stop_reason: geminiFinishToAnthropic(candidate.finishReason),
-    stop_sequence: null,
-    usage: { input_tokens: asNumber(usage.promptTokenCount), output_tokens: asNumber(usage.candidatesTokenCount) },
-  };
-}
-
-/** One server-sent event: `event: <name>` when named, then the data line, then the blank line. */
-function sseEvent(event: string | null, data: unknown): string {
-  return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
-}
-
+/** One SSE frame: an optional event name and its data lines joined. */
 interface SseFrame {
   event: string | null;
   data: string;
 }
 
-/** Split one SSE frame's lines into its event name and data payload. */
-function parseSseFrame(frame: string): SseFrame {
-  let event: string | null = null;
-  const data: string[] = [];
-  for (const line of frame.split('\n')) {
-    if (line.startsWith('event:')) event = line.slice('event:'.length).trim();
-    else if (line.startsWith('data:')) data.push(line.slice('data:'.length).replace(/^ /, ''));
-  }
-  return { event, data: data.join('\n') };
-}
-
-/** A ReadableStream of SSE bytes as its frames, in arrival order. */
-async function* sseFrames(stream: ReadableStream<Uint8Array>): AsyncGenerator<SseFrame> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        yield parseSseFrame(buffer.slice(0, at));
-        buffer = buffer.slice(at + 2);
-        at = buffer.indexOf('\n\n');
-      }
+function parseSse(text: string): SseFrame[] {
+  const frames: SseFrame[] = [];
+  for (const chunk of text.replace(/\r\n/g, '\n').split('\n\n')) {
+    if (chunk.trim() === '') continue;
+    let event: string | null = null;
+    const data: string[] = [];
+    for (const line of chunk.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice('event:'.length).trim();
+      else if (line.startsWith('data:')) data.push(line.slice('data:'.length).replace(/^ /, ''));
     }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') yield parseSseFrame(buffer);
-  } finally {
-    reader.releaseLock();
+    if (data.length > 0) frames.push({ event, data: data.join('\n') });
   }
+  return frames;
 }
 
-function openAIChunk(model: string, delta: Json, finish: string | null): string {
-  return `data: ${JSON.stringify({ id: 'chatcmpl-sim', object: 'chat.completion.chunk', created: FIXED_CREATED, model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+const numOrZero = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+
+/** OpenAI's finish_reason as this entry's stop kind. */
+function stopOfOpenAI(finish: unknown): StopKind {
+  if (finish === 'length') return 'length';
+  if (finish === 'tool_calls' || finish === 'function_call') return 'tool_calls';
+  if (finish === 'content_filter') return 'content_filter';
+  return 'stop';
 }
 
-function openAIUsageChunk(model: string, inputTokens: number, outputTokens: number): string {
-  return `data: ${JSON.stringify({ id: 'chatcmpl-sim', object: 'chat.completion.chunk', created: FIXED_CREATED, model, choices: [], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens } })}\n\n`;
+/** Anthropic's stop_reason as this entry's stop kind. */
+function stopOfAnthropic(reason: unknown): StopKind {
+  if (reason === 'max_tokens') return 'length';
+  if (reason === 'tool_use') return 'tool_calls';
+  if (reason === 'refusal') return 'content_filter';
+  return 'stop';
 }
 
-/**
- * A Chat Completions SSE stream as the Anthropic event sequence:
- * message_start, content_block_start/delta/stop per text block or tool call,
- * then message_delta with the stop reason and usage, then message_stop.
- */
-async function* openAIStreamToAnthropic(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  let started = false;
-  let finished = false;
-  let textIndex = -1;
-  let nextIndex = 0;
-  const toolIndexes = new Map<number, number>();
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let pendingStop: string | null = null;
+/** Gemini's finishReason as this entry's stop kind. */
+function stopOfGemini(reason: unknown): StopKind {
+  if (reason === 'MAX_TOKENS') return 'length';
+  if (reason === 'SAFETY') return 'content_filter';
+  return 'stop';
+}
 
-  const startEvents = function* (): Generator<string> {
-    if (started) return;
-    started = true;
-    yield sseEvent('message_start', {
-      type: 'message_start',
-      message: { id: 'msg_stream', type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 0 } },
+/** The text of a Chat Completions message: a string, or its text parts. */
+function messageText(message: Rec): string {
+  if (typeof message.content === 'string') return message.content;
+  if (!Array.isArray(message.content)) return '';
+  return message.content
+    .flatMap((b) => (isRec(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : []))
+    .join('');
+}
+
+function openAIToolCalls(message: Rec): ToolCallOut[] {
+  const calls: ToolCallOut[] = [];
+  for (const call of Array.isArray(message.tool_calls) ? message.tool_calls : []) {
+    if (!isRec(call) || !isRec(call.function)) continue;
+    calls.push({
+      id: asStr(call.id),
+      name: asStr(call.function.name),
+      args: typeof call.function.arguments === 'string' ? call.function.arguments : '',
     });
-  };
-  const finishEvents = function* (stopReason: string): Generator<string> {
-    if (finished) return;
-    finished = true;
-    if (textIndex !== -1) {
-      yield sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex });
-      textIndex = -1;
-    }
-    for (const index of [...toolIndexes.values()].sort((a, b) => a - b)) yield sseEvent('content_block_stop', { type: 'content_block_stop', index });
-    toolIndexes.clear();
-    yield sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } });
-    yield sseEvent('message_stop', { type: 'message_stop' });
-  };
+  }
+  return calls;
+}
 
-  for await (const frame of sseFrames(upstream)) {
+/** A Chat Completions JSON body as one answer. */
+function parseOpenAIJson(body: unknown): UpstreamAnswer | null {
+  if (!isRec(body)) return null;
+  const choices = Array.isArray(body.choices) ? body.choices : [];
+  const choice = isRec(choices[0]) ? choices[0] : null;
+  if (choice === null || !isRec(choice.message)) return null;
+  const usage = isRec(body.usage) ? body.usage : {};
+  return {
+    text: messageText(choice.message),
+    inputTokens: numOrZero(usage.prompt_tokens),
+    outputTokens: numOrZero(usage.completion_tokens),
+    stop: stopOfOpenAI(choice.finish_reason),
+    toolCalls: openAIToolCalls(choice.message),
+  };
+}
+
+/** A Chat Completions event stream as one answer. */
+function parseOpenAISse(text: string): UpstreamAnswer | null {
+  let outText = '';
+  let input = 0;
+  let output = 0;
+  let stop: StopKind = 'stop';
+  let sawAny = false;
+  for (const frame of parseSse(text)) {
     const payload = frame.data.trim();
-    if (payload === '[DONE]') {
-      yield* startEvents();
-      yield* finishEvents(pendingStop ?? 'end_turn');
-      continue;
-    }
+    if (payload === '[DONE]') break;
     let chunk: unknown;
     try {
       chunk = JSON.parse(payload);
     } catch {
       continue;
     }
-    if (!isRecord(chunk)) continue;
-    if (isRecord(chunk.usage)) {
-      inputTokens = asNumber(chunk.usage.prompt_tokens);
-      outputTokens = asNumber(chunk.usage.completion_tokens);
+    if (!isRec(chunk)) continue;
+    sawAny = true;
+    if (isRec(chunk.usage)) {
+      input = numOrZero(chunk.usage.prompt_tokens);
+      output = numOrZero(chunk.usage.completion_tokens);
     }
     const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
-    if (choices.length === 0) continue;
-    const choice = isRecord(choices[0]) ? choices[0] : null;
+    const choice = isRec(choices[0]) ? choices[0] : null;
     if (choice === null) continue;
-    const delta = isRecord(choice.delta) ? choice.delta : {};
-    yield* startEvents();
-    if (typeof delta.content === 'string' && delta.content !== '') {
-      if (textIndex === -1) {
-        textIndex = nextIndex;
-        nextIndex += 1;
-        yield sseEvent('content_block_start', { type: 'content_block_start', index: textIndex, content_block: { type: 'text', text: '' } });
-      }
-      yield sseEvent('content_block_delta', { type: 'content_block_delta', index: textIndex, delta: { type: 'text_delta', text: delta.content } });
-    }
-    const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
-    for (const call of calls) {
-      if (!isRecord(call)) continue;
-      const upstreamIndex = typeof call.index === 'number' ? call.index : toolIndexes.size;
-      let index = toolIndexes.get(upstreamIndex);
-      if (index === undefined) {
-        if (textIndex !== -1) {
-          yield sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex });
-          textIndex = -1;
-        }
-        index = nextIndex;
-        nextIndex += 1;
-        toolIndexes.set(upstreamIndex, index);
-        const fn = isRecord(call.function) ? call.function : {};
-        yield sseEvent('content_block_start', {
-          type: 'content_block_start',
-          index,
-          content_block: { type: 'tool_use', id: asString(call.id) !== '' ? asString(call.id) : `toolu_${index}`, name: asString(fn.name), input: {} },
-        });
-      }
-      const fn = isRecord(call.function) ? call.function : {};
-      if (typeof fn.arguments === 'string' && fn.arguments !== '') {
-        yield sseEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: fn.arguments } });
-      }
-    }
-    if (typeof choice.finish_reason === 'string' && choice.finish_reason !== '') pendingStop = openAIFinishToAnthropic(choice.finish_reason);
+    if (isRec(choice.delta) && typeof choice.delta.content === 'string') outText += choice.delta.content;
+    if (typeof choice.finish_reason === 'string') stop = stopOfOpenAI(choice.finish_reason);
   }
-  if (!finished) {
-    yield* startEvents();
-    yield* finishEvents(pendingStop ?? 'end_turn');
-  }
+  return sawAny ? { text: outText, inputTokens: input, outputTokens: output, stop, toolCalls: [] } : null;
 }
 
-/**
- * An Anthropic SSE stream as OpenAI chat chunks: a role chunk, content
- * deltas, tool-call deltas, then the finish chunk, a usage chunk and [DONE].
- */
-async function* anthropicStreamToOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  let started = false;
-  let finished = false;
-  let doneEmitted = false;
-  let inputTokens = 0;
-  let outputTokens = 0;
-  const tools = new Map<number, { id: string; name: string; started: boolean }>();
+/** An Anthropic Messages JSON body as one answer. */
+function parseAnthropicJson(body: unknown): UpstreamAnswer | null {
+  if (!isRec(body) || body.type !== 'message' || !Array.isArray(body.content)) return null;
+  let text = '';
+  const toolCalls: ToolCallOut[] = [];
+  for (const block of body.content) {
+    if (!isRec(block)) continue;
+    if (block.type === 'text' && typeof block.text === 'string') text += block.text;
+    else if (block.type === 'tool_use') {
+      toolCalls.push({
+        id: asStr(block.id),
+        name: asStr(block.name),
+        args: JSON.stringify(isRec(block.input) ? block.input : {}),
+      });
+    }
+  }
+  const usage = isRec(body.usage) ? body.usage : {};
+  return {
+    text,
+    inputTokens: numOrZero(usage.input_tokens),
+    outputTokens: numOrZero(usage.output_tokens),
+    stop: stopOfAnthropic(body.stop_reason),
+    toolCalls,
+  };
+}
 
-  for await (const frame of sseFrames(upstream)) {
+/** An Anthropic event stream as one answer. */
+function parseAnthropicSse(text: string): UpstreamAnswer | null {
+  let outText = '';
+  let input = 0;
+  let output = 0;
+  let stop: StopKind = 'stop';
+  let sawAny = false;
+  const toolArgs = new Map<number, { id: string; name: string; parts: string[] }>();
+  for (const frame of parseSse(text)) {
+    if (frame.event === null) continue;
     let data: unknown;
     try {
       data = JSON.parse(frame.data);
     } catch {
       continue;
     }
-    if (!isRecord(data)) continue;
-    if (frame.event === 'message_start') {
-      if (isRecord(data.message) && isRecord(data.message.usage)) inputTokens = asNumber(data.message.usage.input_tokens);
-      if (!started) {
-        started = true;
-        yield openAIChunk(model, { role: 'assistant', content: '' }, null);
+    if (!isRec(data)) continue;
+    sawAny = true;
+    if (frame.event === 'message_start' && isRec(data.message) && isRec(data.message.usage)) {
+      input = numOrZero(data.message.usage.input_tokens);
+    } else if (frame.event === 'content_block_delta' && isRec(data.delta)) {
+      const index = asNum(data.index) ?? 0;
+      if (data.delta.type === 'text_delta' && typeof data.delta.text === 'string') outText += data.delta.text;
+      else if (data.delta.type === 'input_json_delta' && typeof data.delta.partial_json === 'string') {
+        const slot = toolArgs.get(index);
+        if (slot !== undefined) slot.parts.push(data.delta.partial_json);
       }
-    } else if (frame.event === 'content_block_start') {
-      const index = asNumber(data.index);
-      if (isRecord(data.content_block) && data.content_block.type === 'tool_use') {
-        tools.set(index, { id: asString(data.content_block.id) !== '' ? asString(data.content_block.id) : `call_${index}`, name: asString(data.content_block.name), started: false });
-      }
-    } else if (frame.event === 'content_block_delta') {
-      const index = asNumber(data.index);
-      const delta = isRecord(data.delta) ? data.delta : {};
-      if (delta.type === 'text_delta' && typeof delta.text === 'string' && delta.text !== '') {
-        if (!started) {
-          started = true;
-          yield openAIChunk(model, { role: 'assistant', content: '' }, null);
-        }
-        yield openAIChunk(model, { content: delta.text }, null);
-      } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string' && delta.partial_json !== '') {
-        const tool = tools.get(index);
-        if (tool !== undefined) {
-          if (!tool.started) {
-            tool.started = true;
-            yield openAIChunk(model, { tool_calls: [{ index, id: tool.id, type: 'function', function: { name: tool.name, arguments: '' } }] }, null);
-          }
-          yield openAIChunk(model, { tool_calls: [{ index, function: { arguments: delta.partial_json } }] }, null);
-        }
+    } else if (frame.event === 'content_block_start' && isRec(data.content_block)) {
+      const index = asNum(data.index) ?? 0;
+      if (data.content_block.type === 'tool_use') {
+        toolArgs.set(index, { id: asStr(data.content_block.id), name: asStr(data.content_block.name), parts: [] });
       }
     } else if (frame.event === 'message_delta') {
-      const delta = isRecord(data.delta) ? data.delta : {};
-      const stop = typeof delta.stop_reason === 'string' ? anthropicStopToOpenAI(delta.stop_reason) : 'stop';
-      if (isRecord(data.usage)) outputTokens = asNumber(data.usage.output_tokens);
-      if (!started) {
-        started = true;
-        yield openAIChunk(model, { role: 'assistant', content: '' }, null);
-      }
-      yield openAIChunk(model, {}, stop);
-      yield openAIUsageChunk(model, inputTokens, outputTokens);
-      finished = true;
-    } else if (frame.event === 'message_stop') {
-      yield 'data: [DONE]\n\n';
-      doneEmitted = true;
+      if (isRec(data.delta) && typeof data.delta.stop_reason === 'string') stop = stopOfAnthropic(data.delta.stop_reason);
+      if (isRec(data.usage)) output = numOrZero(data.usage.output_tokens);
     }
   }
-  if (!finished) {
-    if (!started) {
-      started = true;
-      yield openAIChunk(model, { role: 'assistant', content: '' }, null);
-    }
-    yield openAIChunk(model, {}, 'stop');
-    yield openAIUsageChunk(model, inputTokens, outputTokens);
-  }
-  if (!doneEmitted) yield 'data: [DONE]\n\n';
+  const toolCalls: ToolCallOut[] = [...toolArgs.values()].map((t) => ({ id: t.id, name: t.name, args: t.parts.join('') }));
+  return sawAny ? { text: outText, inputTokens: input, outputTokens: output, stop, toolCalls } : null;
 }
 
-/**
- * A Gemini :streamGenerateContent SSE stream as OpenAI chat chunks: content
- * deltas, then the finish chunk (from the final frame's finishReason and
- * usageMetadata), a usage chunk and [DONE].
- */
-async function* geminiStreamToOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  let started = false;
-  let finished = false;
-  let doneEmitted = false;
-  let inputTokens = 0;
-  let outputTokens = 0;
-
-  for await (const frame of sseFrames(upstream)) {
-    let data: unknown;
-    try {
-      data = JSON.parse(frame.data);
-    } catch {
-      continue;
-    }
-    if (!isRecord(data)) continue;
-    const candidates = Array.isArray(data.candidates) ? data.candidates : [];
-    const candidate = isRecord(candidates[0]) ? candidates[0] : null;
-    if (candidate === null) continue;
-    const text = geminiCandidateText(candidate);
-    if (text !== '') {
-      if (!started) {
-        started = true;
-        yield openAIChunk(model, { role: 'assistant', content: '' }, null);
-      }
-      yield openAIChunk(model, { content: text }, null);
-    }
-    if (typeof candidate.finishReason === 'string') {
-      if (isRecord(data.usageMetadata)) {
-        inputTokens = asNumber(data.usageMetadata.promptTokenCount);
-        outputTokens = asNumber(data.usageMetadata.candidatesTokenCount);
-      }
-      if (!started) {
-        started = true;
-        yield openAIChunk(model, { role: 'assistant', content: '' }, null);
-      }
-      yield openAIChunk(model, {}, geminiFinishToOpenAI(candidate.finishReason));
-      yield openAIUsageChunk(model, inputTokens, outputTokens);
-      finished = true;
+/** A Gemini generateContent JSON body as one answer. */
+function parseGeminiJson(body: unknown): UpstreamAnswer | null {
+  if (!isRec(body) || !Array.isArray(body.candidates)) return null;
+  const candidate = isRec(body.candidates[0]) ? body.candidates[0] : null;
+  if (candidate === null) return null;
+  let text = '';
+  if (isRec(candidate.content) && Array.isArray(candidate.content.parts)) {
+    for (const part of candidate.content.parts) {
+      if (isRec(part) && typeof part.text === 'string') text += part.text;
     }
   }
-  if (!finished) {
-    if (!started) {
-      started = true;
-      yield openAIChunk(model, { role: 'assistant', content: '' }, null);
-    }
-    yield openAIChunk(model, {}, 'stop');
-    yield openAIUsageChunk(model, inputTokens, outputTokens);
-  }
-  if (!doneEmitted) yield 'data: [DONE]\n\n';
-}
-
-/**
- * A Gemini :streamGenerateContent SSE stream as the Anthropic event
- * sequence, with the final frame's finishReason and usageMetadata carried
- * into message_delta.
- */
-async function* geminiStreamToAnthropic(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  let started = false;
-  let finished = false;
-  let textOpen = false;
-  let inputTokens = 0;
-  let outputTokens = 0;
-
-  const startEvents = function* (): Generator<string> {
-    if (started) return;
-    started = true;
-    yield sseEvent('message_start', {
-      type: 'message_start',
-      message: { id: 'msg_stream', type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 0 } },
-    });
+  const usage = isRec(body.usageMetadata) ? body.usageMetadata : {};
+  return {
+    text,
+    inputTokens: numOrZero(usage.promptTokenCount),
+    outputTokens: numOrZero(usage.candidatesTokenCount),
+    stop: stopOfGemini(candidate.finishReason),
+    toolCalls: [],
   };
+}
 
-  for await (const frame of sseFrames(upstream)) {
-    let data: unknown;
+/** A Gemini streamGenerateContent event stream as one answer. */
+function parseGeminiSse(text: string): UpstreamAnswer | null {
+  let outText = '';
+  let input = 0;
+  let output = 0;
+  let stop: StopKind = 'stop';
+  let sawAny = false;
+  for (const frame of parseSse(text)) {
+    let chunk: unknown;
     try {
-      data = JSON.parse(frame.data);
+      chunk = JSON.parse(frame.data);
     } catch {
       continue;
     }
-    if (!isRecord(data)) continue;
-    const candidates = Array.isArray(data.candidates) ? data.candidates : [];
-    const candidate = isRecord(candidates[0]) ? candidates[0] : null;
-    if (candidate === null) continue;
-    const text = geminiCandidateText(candidate);
-    if (text !== '') {
-      yield* startEvents();
-      if (!textOpen) {
-        textOpen = true;
-        yield sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+    if (!isRec(chunk)) continue;
+    sawAny = true;
+    if (Array.isArray(chunk.candidates)) {
+      for (const candidate of chunk.candidates) {
+        if (!isRec(candidate)) continue;
+        if (isRec(candidate.content) && Array.isArray(candidate.content.parts)) {
+          for (const part of candidate.content.parts) {
+            if (isRec(part) && typeof part.text === 'string') outText += part.text;
+          }
+        }
+        if (typeof candidate.finishReason === 'string') stop = stopOfGemini(candidate.finishReason);
       }
-      yield sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } });
     }
-    if (typeof candidate.finishReason === 'string') {
-      if (isRecord(data.usageMetadata)) {
-        inputTokens = asNumber(data.usageMetadata.promptTokenCount);
-        outputTokens = asNumber(data.usageMetadata.candidatesTokenCount);
-      }
-      yield* startEvents();
-      if (textOpen) {
-        textOpen = false;
-        yield sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
-      }
-      yield sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: geminiFinishToAnthropic(candidate.finishReason), stop_sequence: null }, usage: { output_tokens: outputTokens } });
-      yield sseEvent('message_stop', { type: 'message_stop' });
-      finished = true;
+    if (isRec(chunk.usageMetadata)) {
+      input = numOrZero(chunk.usageMetadata.promptTokenCount);
+      output = numOrZero(chunk.usageMetadata.candidatesTokenCount);
     }
   }
-  if (!finished) {
-    yield* startEvents();
-    if (textOpen) yield sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
-    yield sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: outputTokens } });
-    yield sseEvent('message_stop', { type: 'message_stop' });
-  }
+  return sawAny ? { text: outText, inputTokens: input, outputTokens: output, stop, toolCalls: [] } : null;
 }
 
-// ---------------------------------------------------------------------------
-// Upstream calls
-// ---------------------------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* One upstream call                                                   */
+/* ------------------------------------------------------------------ */
 
-/** One inference call to a provider, in its own wire, with the client's body translated. */
-async function callUpstream(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json, stream: boolean): Promise<Response> {
-  const provider = candidate.provider;
-  const base = joinBase(ENV_URL, provider.base);
-  const headers: Record<string, string> = { 'content-type': 'application/json', ...authHeaders(provider.auth, provider.key) };
+interface CallOutcome {
+  ok: boolean;
+  status: number;
+  retryable: boolean;
+  answer: UpstreamAnswer | null;
+}
+
+/** Build the upstream request for one candidate and read its answer. */
+async function callUpstream(
+  cand: Candidate,
+  clientApi: 'openai' | 'anthropic',
+  body: Rec,
+  stream: boolean,
+): Promise<CallOutcome> {
+  const base = joinBase(ENV_URL, cand.provider.path);
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    ...keyHeaders(cand.provider.auth, cand.provider.key),
+  };
   let url: string;
-  let payload: Json;
-  if (provider.wire === 'openai') {
+  let upstreamBody: Rec;
+  if (cand.wire === 'openai') {
     url = `${base}/v1/chat/completions`;
-    payload = clientApi === 'openai' ? { ...body, model: candidate.model } : anthropicToOpenAI(body, candidate.model);
+    upstreamBody = clientApi === 'openai' ? { ...body, model: cand.modelId } : anthropicToOpenAI(body, cand.modelId);
     if (stream) {
-      payload.stream = true;
-      payload.stream_options = { include_usage: true };
       headers.accept = 'text/event-stream';
+      upstreamBody.stream = true;
+      upstreamBody.stream_options = { include_usage: true };
     }
-  } else if (provider.wire === 'anthropic') {
+  } else if (cand.wire === 'anthropic') {
     url = `${base}/v1/messages`;
-    headers['anthropic-version'] = ANTHROPIC_VERSION;
-    payload = clientApi === 'anthropic' ? { ...body, model: candidate.model } : openAIToAnthropic(body, candidate.model);
-    if (stream) {
-      payload.stream = true;
-      headers.accept = 'text/event-stream';
-    }
+    headers['anthropic-version'] = '2023-06-01';
+    upstreamBody = clientApi === 'anthropic' ? { ...body, model: cand.modelId } : openAIToAnthropic(body, cand.modelId);
+    if (stream) upstreamBody.stream = true;
   } else {
-    const method = stream ? 'streamGenerateContent' : 'generateContent';
-    url = `${base}/v1beta/models/${encodeURIComponent(candidate.model)}:${method}${stream ? '?alt=sse' : ''}`;
-    payload = clientApi === 'openai' ? openAIToGemini(body) : anthropicToGemini(body);
+    const action = stream ? 'streamGenerateContent' : 'generateContent';
+    url = `${base}/v1beta/models/${encodeURIComponent(cand.modelId)}:${action}${stream ? '?alt=sse' : ''}`;
     if (stream) headers.accept = 'text/event-stream';
+    upstreamBody = toGemini(body, clientApi);
   }
-  callsMade[provider.id] = (callsMade[provider.id] ?? 0) + 1;
-  return fetch(url, { method: 'POST', headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(upstreamBody),
+      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+    });
+  } catch {
+    return { ok: false, status: 0, retryable: true, answer: null };
+  }
+  const text = await res.text();
+  if (!res.ok) {
+    const retryable = res.status === 402 || res.status === 429 || res.status >= 500;
+    return { ok: false, status: res.status, retryable, answer: null };
+  }
+  let answer: UpstreamAnswer | null = null;
+  if (cand.wire === 'openai') {
+    answer = stream ? parseOpenAISse(text) : parseOpenAIJson(safeJson(text));
+  } else if (cand.wire === 'anthropic') {
+    answer = stream ? parseAnthropicSse(text) : parseAnthropicJson(safeJson(text));
+  } else {
+    answer = stream ? parseGeminiSse(text) : parseGeminiJson(safeJson(text));
+  }
+  if (answer === null) return { ok: false, status: res.status, retryable: false, answer: null };
+  return { ok: true, status: res.status, retryable: false, answer };
 }
 
-// ---------------------------------------------------------------------------
-// Serving
-// ---------------------------------------------------------------------------
+function safeJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
 
-/** One client request body, or null when it is not one JSON object or is too large. */
-async function readJson(req: IncomingMessage): Promise<Json | null> {
+interface Served {
+  answer: UpstreamAnswer;
+  modelId: string;
+}
+
+/**
+ * Serve one client request: walk the candidates best-first, retrying a
+ * refusal once on the same provider (a scheduled failure is usually one
+ * call number) and then moving on. A provider that fails twice in a row
+ * is retired for the trial. Returns null only when nothing could serve it.
+ */
+async function serveRequest(
+  clientApi: 'openai' | 'anthropic',
+  body: Rec,
+  needs: Need,
+  jsonMode: boolean,
+  stream: boolean,
+): Promise<Served | null> {
+  let retriesLeft = 1;
+  let forced: Candidate | null = null;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    let cand: Candidate | null = null;
+    if (forced !== null) {
+      const st = stateOf(forced.providerId);
+      if (!st.dead && st.calls < callCap(forced.providerId)) cand = forced;
+      forced = null;
+    }
+    if (cand === null) {
+      const list = candidatesFor(needs, jsonMode);
+      if (list.length === 0) return null;
+      cand = list[0];
+    }
+    const st = stateOf(cand.providerId);
+    const outcome = await callUpstream(cand, clientApi, body, stream);
+    st.calls += 1;
+    if (outcome.ok && outcome.answer !== null) {
+      st.failsInRow = 0;
+      return { answer: outcome.answer, modelId: cand.modelId };
+    }
+    st.failsInRow += 1;
+    if (outcome.status === 400 || outcome.status === 401) st.dead = true;
+    else if (st.failsInRow >= RETIRE_AFTER_FAILS) st.dead = true;
+    if (retriesLeft > 0 && outcome.retryable && !st.dead) {
+      retriesLeft -= 1;
+      forced = cand;
+      continue;
+    }
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* Rendering: one upstream answer in the client's wire                 */
+/* ------------------------------------------------------------------ */
+
+function finishOf(stop: StopKind): string {
+  if (stop === 'length') return 'length';
+  if (stop === 'tool_calls') return 'tool_calls';
+  if (stop === 'content_filter') return 'content_filter';
+  return 'stop';
+}
+
+function stopReasonOf(stop: StopKind): string {
+  if (stop === 'length') return 'max_tokens';
+  if (stop === 'tool_calls') return 'tool_use';
+  if (stop === 'content_filter') return 'refusal';
+  return 'end_turn';
+}
+
+/** One server-sent event frame. */
+function sseFrame(event: string | null, data: unknown): string {
+  return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
+}
+
+/** Split text into pieces for streamed deltas. */
+function textPieces(text: string, size = 64): string[] {
+  if (text === '') return [];
+  const out: string[] = [];
+  for (let at = 0; at < text.length; at += size) out.push(text.slice(at, at + size));
+  return out;
+}
+
+/** An upstream answer as a Chat Completions JSON body. */
+function renderOpenAIJson(answer: UpstreamAnswer, model: string): Rec {
+  const message: Rec = { role: 'assistant', content: answer.text };
+  if (answer.toolCalls.length > 0) {
+    message.tool_calls = answer.toolCalls.map((c) => ({
+      id: c.id !== '' ? c.id : 'call_agg',
+      type: 'function',
+      function: { name: c.name, arguments: c.args },
+    }));
+  }
+  return {
+    id: 'chatcmpl-agg',
+    object: 'chat.completion',
+    created: FIXED_CREATED,
+    model,
+    choices: [{ index: 0, message, finish_reason: finishOf(answer.stop) }],
+    usage: {
+      prompt_tokens: answer.inputTokens,
+      completion_tokens: answer.outputTokens,
+      total_tokens: answer.inputTokens + answer.outputTokens,
+    },
+  };
+}
+
+/** An upstream answer as a Chat Completions event stream. */
+function renderOpenAISse(answer: UpstreamAnswer, model: string): string {
+  const frames: string[] = [];
+  const chunk = (delta: Rec, finish: string | null): Rec => ({
+    id: 'chatcmpl-agg',
+    object: 'chat.completion.chunk',
+    created: FIXED_CREATED,
+    model,
+    choices: [{ index: 0, delta, finish_reason: finish }],
+  });
+  frames.push(sseFrame(null, chunk({ role: 'assistant', content: '' }, null)));
+  for (const piece of textPieces(answer.text)) frames.push(sseFrame(null, chunk({ content: piece }, null)));
+  frames.push(sseFrame(null, chunk({}, finishOf(answer.stop))));
+  frames.push(
+    sseFrame(null, {
+      id: 'chatcmpl-agg',
+      object: 'chat.completion.chunk',
+      created: FIXED_CREATED,
+      model,
+      choices: [],
+      usage: {
+        prompt_tokens: answer.inputTokens,
+        completion_tokens: answer.outputTokens,
+        total_tokens: answer.inputTokens + answer.outputTokens,
+      },
+    }),
+  );
+  frames.push('data: [DONE]\n\n');
+  return frames.join('');
+}
+
+/** An upstream answer as an Anthropic Messages JSON body. */
+function renderAnthropicJson(answer: UpstreamAnswer, model: string): Rec {
+  const content: Rec[] = [];
+  if (answer.text !== '') content.push({ type: 'text', text: answer.text });
+  for (const call of answer.toolCalls) {
+    content.push({
+      type: 'tool_use',
+      id: call.id !== '' ? call.id : 'toolu_agg',
+      name: call.name,
+      input: argsObject(call.args),
+    });
+  }
+  if (content.length === 0) content.push({ type: 'text', text: '' });
+  return {
+    id: 'msg_agg',
+    type: 'message',
+    role: 'assistant',
+    model,
+    content,
+    stop_reason: stopReasonOf(answer.stop),
+    stop_sequence: null,
+    usage: { input_tokens: answer.inputTokens, output_tokens: answer.outputTokens },
+  };
+}
+
+/** An upstream answer as an Anthropic event stream. */
+function renderAnthropicSse(answer: UpstreamAnswer, model: string): string {
+  const frames: string[] = [];
+  frames.push(
+    sseFrame('message_start', {
+      type: 'message_start',
+      message: {
+        id: 'msg_agg',
+        type: 'message',
+        role: 'assistant',
+        model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: answer.inputTokens, output_tokens: 0 },
+      },
+    }),
+  );
+  let index = 0;
+  if (answer.text !== '' || answer.toolCalls.length === 0) {
+    frames.push(sseFrame('content_block_start', { type: 'content_block_start', index, content_block: { type: 'text', text: '' } }));
+    for (const piece of textPieces(answer.text)) {
+      frames.push(sseFrame('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'text_delta', text: piece } }));
+    }
+    frames.push(sseFrame('content_block_stop', { type: 'content_block_stop', index }));
+    index += 1;
+  }
+  for (const call of answer.toolCalls) {
+    frames.push(
+      sseFrame('content_block_start', {
+        type: 'content_block_start',
+        index,
+        content_block: { type: 'tool_use', id: call.id !== '' ? call.id : `toolu_${index}`, name: call.name, input: {} },
+      }),
+    );
+    if (call.args !== '') {
+      frames.push(
+        sseFrame('content_block_delta', {
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'input_json_delta', partial_json: call.args },
+        }),
+      );
+    }
+    frames.push(sseFrame('content_block_stop', { type: 'content_block_stop', index }));
+    index += 1;
+  }
+  frames.push(
+    sseFrame('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: stopReasonOf(answer.stop), stop_sequence: null },
+      usage: { output_tokens: answer.outputTokens },
+    }),
+    sseFrame('message_stop', { type: 'message_stop' }),
+  );
+  return frames.join('');
+}
+
+/* ------------------------------------------------------------------ */
+/* HTTP server                                                         */
+/* ------------------------------------------------------------------ */
+
+/** How many client API requests have arrived; the manifest is in order. */
+let manifestIndex = 0;
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const text = JSON.stringify(body);
+  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) });
+  res.end(text);
+}
+
+function openAIError(message: string, type: string): Rec {
+  return { error: { message, type, code: null } };
+}
+
+function anthropicError(type: string, message: string): Rec {
+  return { type: 'error', error: { type, message } };
+}
+
+function sendError(res: ServerResponse, api: 'openai' | 'anthropic', status: number, type: string, message: string): void {
+  if (api === 'anthropic') sendJson(res, status, anthropicError(type, message));
+  else sendJson(res, status, openAIError(message, type));
+}
+
+function openAIModelList(models: { id: string; provider: string }[]): Rec {
+  return {
+    object: 'list',
+    data: models.map((m) => ({ id: m.id, object: 'model', created: FIXED_CREATED, owned_by: m.provider })),
+  };
+}
+
+function anthropicModelList(models: { id: string; displayName: string }[]): Rec {
+  return {
+    data: models.map((m) => ({ type: 'model', id: m.id, display_name: m.displayName, created_at: FIXED_CREATED_AT })),
+    has_more: false,
+  };
+}
+
+/** GET /v1/models, in the shape of the auth header the client sent. */
+function handleModels(req: IncomingMessage, res: ServerResponse): void {
+  const models = servedModels();
+  const seen = new Set<string>();
+  const unique = models.filter((m) => {
+    if (seen.has(m.id)) return false;
+    seen.add(m.id);
+    return true;
+  });
+  unique.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  if (typeof req.headers['x-api-key'] === 'string') sendJson(res, 200, anthropicModelList(unique));
+  else sendJson(res, 200, openAIModelList(unique));
+}
+
+/** One client request body, or null when it is not one JSON object. */
+async function readJsonBody(req: IncomingMessage): Promise<Rec | null> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
@@ -1519,175 +1612,89 @@ async function readJson(req: IncomingMessage): Promise<Json | null> {
   if (chunks.length === 0) return null;
   try {
     const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    return isRecord(value) ? value : null;
+    return isRec(value) ? value : null;
   } catch {
     return null;
   }
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const text = JSON.stringify(body);
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) });
-  res.end(text);
-}
-
-/** An error in the client's wire. */
-function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, type: string, message: string): void {
-  if (wire === 'anthropic') sendJson(res, status, { type: 'error', error: { type, message } });
-  else sendJson(res, status, { error: { message, type, code: null } });
-}
-
-/** GET /v1/models, in the shape of the auth header the client sent. */
-function serveModels(req: IncomingMessage, res: ServerResponse): void {
-  const list = servedModelIds();
-  if (typeof req.headers['x-api-key'] === 'string') {
-    sendJson(res, 200, {
-      data: list.map((m) => ({ type: 'model', id: m.id, display_name: m.display_name, created_at: FIXED_CREATED_AT })),
-      has_more: false,
-    });
-  } else {
-    sendJson(res, 200, {
-      object: 'list',
-      data: list.map((m) => ({ id: m.id, object: 'model', created: FIXED_CREATED, owned_by: m.provider })),
-    });
+/** The request's needs: the manifest's row by arrival order, else the body. */
+function needsFor(api: 'openai' | 'anthropic', body: Rec): { needs: Need; jsonMode: boolean } {
+  const entry = brief.manifest[manifestIndex];
+  manifestIndex += 1;
+  if (entry !== undefined) {
+    const jsonMode =
+      api === 'openai' &&
+      isRec(body.response_format) &&
+      (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema');
+    return { needs: entry.needs, jsonMode };
   }
-}
-
-/** Copy a provider's event stream to the client as it arrives. */
-async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerResponse): Promise<void> {
-  const reader = stream.getReader();
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      res.write(Buffer.from(value));
+  let vision = false;
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  for (const message of messages) {
+    if (!isRec(message) || !Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (!isRec(block)) continue;
+      if (block.type === 'image' || block.type === 'image_url') vision = true;
     }
-  } finally {
-    reader.releaseLock();
-    res.end();
   }
+  const jsonMode =
+    api === 'openai' &&
+    isRec(body.response_format) &&
+    (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema');
+  return {
+    needs: {
+      tools: Array.isArray(body.tools) && body.tools.length > 0,
+      vision,
+      json: jsonMode,
+      minContext: null,
+    },
+    jsonMode,
+  };
 }
 
-/** Write a translated event stream to the client as it arrives. */
-async function pipeEvents(events: AsyncGenerator<string>, res: ServerResponse): Promise<void> {
-  for await (const event of events) res.write(event);
-  res.end();
-}
-
-/**
- * Answer one client request from a provider that answered 2xx: JSON straight
- * through or translated, SSE straight through or translated, in the wire the
- * client used.
- */
-async function serveUpstream(
-  clientApi: 'openai' | 'anthropic',
-  candidate: Candidate,
-  upstream: Response,
-  stream: boolean,
-  res: ServerResponse,
-): Promise<void> {
-  const wire = candidate.provider.wire;
-  const model = candidate.model;
+async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJsonBody(req);
+  if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  const stream = body.stream === true;
+  const { needs, jsonMode } = needsFor('openai', body);
+  const served = await serveRequest('openai', body, needs, jsonMode, stream);
+  if (served === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model meets this request');
   if (stream) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    if (upstream.body === null) {
-      res.end('data: [DONE]\n\n');
-      return;
-    }
-    if (clientApi === 'openai' && wire === 'openai') await pipeStream(upstream.body, res);
-    else if (clientApi === 'anthropic' && wire === 'anthropic') await pipeStream(upstream.body, res);
-    else if (clientApi === 'anthropic' && wire === 'openai') await pipeEvents(openAIStreamToAnthropic(upstream.body, model), res);
-    else if (clientApi === 'openai' && wire === 'anthropic') await pipeEvents(anthropicStreamToOpenAI(upstream.body, model), res);
-    else if (clientApi === 'openai' && wire === 'gemini') await pipeEvents(geminiStreamToOpenAI(upstream.body, model), res);
-    else await pipeEvents(geminiStreamToAnthropic(upstream.body, model), res);
+    res.end(renderOpenAISse(served.answer, served.modelId));
     return;
   }
-  const text = await upstream.text();
-  if (clientApi === 'openai' && wire === 'openai') {
-    res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
-    res.end(text);
-    return;
-  }
-  if (clientApi === 'anthropic' && wire === 'anthropic') {
-    res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
-    res.end(text);
-    return;
-  }
-  let answer: unknown;
-  try {
-    answer = JSON.parse(text);
-  } catch {
-    return sendError(res, clientApi, 502, clientApi === 'anthropic' ? 'api_error' : 'server_error', 'the provider answered a body that is not JSON');
-  }
-  if (!isRecord(answer)) {
-    return sendError(res, clientApi, 502, clientApi === 'anthropic' ? 'api_error' : 'server_error', 'the provider answered a JSON value that is not one object');
-  }
-  if (clientApi === 'anthropic' && wire === 'openai') sendJson(res, 200, openAIJsonToAnthropic(answer, model));
-  else if (clientApi === 'openai' && wire === 'anthropic') sendJson(res, 200, anthropicJsonToOpenAI(answer, model));
-  else if (clientApi === 'openai' && wire === 'gemini') sendJson(res, 200, geminiJsonToOpenAI(answer, model));
-  else sendJson(res, 200, geminiJsonToAnthropic(answer, model));
+  sendJson(res, 200, renderOpenAIJson(served.answer, served.modelId));
 }
 
-/** One client inference request, served by the best free model that answers. */
-async function serveInference(req: IncomingMessage, res: ServerResponse, clientApi: 'openai' | 'anthropic'): Promise<void> {
-  const body = await readJson(req);
-  if (body === null) {
-    // The client still sent this request, so its manifest row is consumed.
-    manifestIndex += 1;
-    return sendError(res, clientApi, 400, clientApi === 'anthropic' ? 'invalid_request_error' : 'invalid_request_error', 'the request body is not one JSON object');
-  }
-  const index = manifestIndex;
-  const requires = requirementsFor(body, clientApi);
+async function handleMessages(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJsonBody(req);
+  if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const stream = body.stream === true;
-  const jsonMode =
-    clientApi === 'openai' && isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema');
-  const planned = plannedPicks[index] ?? null;
-  const order = attemptOrder(requires, jsonMode, planned);
-  let lastError = 'no free model on the directory meets this request';
-  for (const candidate of order) {
-    let upstream: Response;
-    try {
-      upstream = await callUpstream(candidate, clientApi, body, stream);
-    } catch (err) {
-      refusals[candidate.provider.id] = (refusals[candidate.provider.id] ?? 0) + 1;
-      consecutiveRefusals[candidate.provider.id] = (consecutiveRefusals[candidate.provider.id] ?? 0) + 1;
-      lastError = (err as Error).message;
-      log(`request ${index + 1}: ${candidate.provider.id}/${candidate.model} unreachable: ${lastError}`);
-      continue;
-    }
-    if (!upstream.ok) {
-      refusals[candidate.provider.id] = (refusals[candidate.provider.id] ?? 0) + 1;
-      consecutiveRefusals[candidate.provider.id] = (consecutiveRefusals[candidate.provider.id] ?? 0) + 1;
-      lastError = `HTTP ${upstream.status}`;
-      try {
-        await upstream.text();
-      } catch {
-        // The refusal's body does not matter.
-      }
-      log(`request ${index + 1}: ${candidate.provider.id}/${candidate.model} refused with HTTP ${upstream.status}`);
-      continue;
-    }
-    consecutiveRefusals[candidate.provider.id] = 0;
-    log(`request ${index + 1}: served by ${candidate.provider.id}/${candidate.model}`);
-    await serveUpstream(clientApi, candidate, upstream, stream, res);
+  const { needs, jsonMode } = needsFor('anthropic', body);
+  const served = await serveRequest('anthropic', body, needs, jsonMode, stream);
+  if (served === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model meets this request');
+  if (stream) {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+    res.end(renderAnthropicSse(served.answer, served.modelId));
     return;
   }
-  log(`request ${index + 1}: no provider served it (${lastError})`);
-  sendError(res, clientApi, 503, clientApi === 'anthropic' ? 'overloaded_error' : 'server_error', lastError);
+  sendJson(res, 200, renderAnthropicJson(served.answer, served.modelId));
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://entry');
   if (req.method === 'GET' && url.pathname === '/v1/models') {
-    serveModels(req, res);
+    handleModels(req, res);
     return;
   }
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
-    await serveInference(req, res, 'openai');
+    await handleChat(req, res);
     return;
   }
   if (req.method === 'POST' && url.pathname === '/v1/messages') {
-    await serveInference(req, res, 'anthropic');
+    await handleMessages(req, res);
     return;
   }
   sendError(res, url.pathname === '/v1/messages' ? 'anthropic' : 'openai', 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`);
@@ -1700,30 +1707,30 @@ function listen(server: Server): Promise<void> {
   });
 }
 
-/** POST /register with the port and the one catalog; the env answers with the workload's size. */
-async function register(port: number, report: Catalog): Promise<void> {
-  let lastError: Error | null = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
+/** POST /register with the port and the one catalog. */
+async function register(port: number): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt++) {
     try {
       const res = await fetch(`${ENV_URL}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: report }),
-        signal: AbortSignal.timeout(5000),
+        body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog }),
+        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       });
-      if (!res.ok) throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
+      if (!res.ok) throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}`);
       const reply: unknown = await res.json();
-      if (isRecord(reply) && typeof reply.requests === 'number') log(`registered: the workload holds ${reply.requests} requests`);
+      if (isRec(reply) && typeof reply.requests === 'number') {
+        log(`registered: the workload holds ${reply.requests} requests`);
+      }
       return;
     } catch (err) {
-      lastError = err as Error;
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      if (attempt === 4) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 200));
     }
   }
-  throw lastError ?? new Error('register failed');
 }
 
-/** Poll GET /work every 100 ms; exit 0 the moment it says done. */
+/** Poll GET /work; exit 0 the moment it says done. */
 function poll(server: Server): void {
   let inFlight = false;
   const timer = setInterval(() => {
@@ -1732,12 +1739,13 @@ function poll(server: Server): void {
     void (async () => {
       try {
         const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
-        if (res.status !== 200) return;
-        const work: unknown = await res.json();
-        if (isRecord(work) && work.done === true) {
-          clearInterval(timer);
-          server.close();
-          process.exit(0);
+        if (res.status === 200) {
+          const work: unknown = await res.json();
+          if (isRec(work) && work.done === true) {
+            clearInterval(timer);
+            server.close();
+            process.exit(0);
+          }
         }
       } catch {
         // The env is not reachable yet: try again on the next tick.
@@ -1745,23 +1753,15 @@ function poll(server: Server): void {
         inFlight = false;
       }
     })();
-  }, POLL_INTERVAL_MS);
-}
-
-/** Probe every provider and build the one catalog (the `--list` document and the register body). */
-async function load(): Promise<void> {
-  if (brief.error !== null) log(brief.error);
-  probes = await Promise.all(brief.providers.map((provider) => probeProvider(ENV_URL, provider)));
-  for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
-  catalog = buildCatalog(brief, probes);
-  plannedPicks = planPicks();
+  }, POLL_MS);
 }
 
 async function start(): Promise<void> {
-  await load();
+  if (brief.problem !== null) log(brief.problem);
+  probes = await Promise.all(brief.providers.map((provider) => probeOne(ENV_URL, provider)));
+  for (const probe of probes) if (!probe.ok && probe.problem !== null) log(probe.problem);
+  catalog = buildCatalog(brief, probes);
   if (process.argv.includes('--list')) {
-    // The same document the register body carries, byte for byte: print the one built object and stop
-    // before any server starts. A process whose stdout is not flushed loses the tail, so wait for it.
     const text = `${JSON.stringify(catalog)}\n`;
     await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
     process.exit(0);
@@ -1770,17 +1770,18 @@ async function start(): Promise<void> {
   const server = createServer((req, res) => {
     void handle(req, res).catch((err: unknown) => {
       log((err as Error).stack ?? String(err));
-      if (!res.headersSent) sendError(res, req.url?.startsWith('/v1/messages') === true ? 'anthropic' : 'openai', 500, 'internal_error', 'the server failed to answer');
+      if (!res.headersSent) {
+        sendError(res, req.url?.startsWith('/v1/messages') === true ? 'anthropic' : 'openai', 500, 'internal_error', 'the server failed to answer');
+      }
     });
   });
   await listen(server);
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server has no port');
   const port = address.port;
-  // 8080 is the env's on one layout; the OS's ephemeral range never holds it, and the guard says so.
   if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
-  log(`listening on 0.0.0.0:${port} with ${catalog.providers.length} answered providers and ${servedModelIds().length} free models`);
-  await register(port, catalog);
+  log(`listening on 0.0.0.0:${port} with ${catalog.providers.length} answered providers and ${servedModels().length} free models`);
+  await register(port);
   process.on('SIGTERM', () => process.exit(0));
   process.on('SIGINT', () => process.exit(0));
   poll(server);
